@@ -107,8 +107,7 @@ Two host-facing surfaces per [`@audio/compile` CONTRACT.md](https://github.com/a
 
 `audio.d.ts` is **hand-written, not tool-generated**: `@audio/compile/tools/dts.js` only
 walks monorepo `<family>/packages/*` layouts (`readdirSync(FAM, fam, 'packages')`) — it
-has no root-package mode, and this repo is a root package (mirrors `@audio/wam`'s shape,
-no `packages/` dir). Content matches the tool's own generated format otherwise.
+has no root-package mode, and this repo is a root package with no `packages/` dir. Content matches the tool's own generated format otherwise.
 
 ## Scope
 
