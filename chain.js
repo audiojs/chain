@@ -13,7 +13,7 @@ import lraFn from '@audio/loudness-lra'
 import { minStats } from '@audio/noise-estimate'
 import { stftAnalyse } from '@audio/stft'
 import { vad } from '@audio/vad'
-import { classify } from '@audio/denoise-detect'
+import { classify, CLICK_RATE } from '@audio/denoise-detect'
 import ltasFn from '@audio/spectral-ltas'
 import targetCurve, { deviation } from '@audio/spectral-target'
 import dehum from '@audio/denoise-dehum'
@@ -160,7 +160,7 @@ export function analyze(channels, { fs = 44100 } = {}) {
   const clipping = detectClipping(channels)
 
   // Reuse denoise-detect's own classifier for the click score rather than re-deriving
-  // AR-residual kurtosis — plan() reuses its exact threshold (12) for the declick trigger.
+  // its impulse rate: plan() triggers declick on its own threshold (CLICK_RATE).
   const { scores } = classify(Float32Array.from(mono), fs)
   const clicks = scores.click
 
@@ -235,14 +235,13 @@ export function plan(analysis, opts = {}) {
     })
   }
 
-  // 4. declick — only if denoise-detect's own click score clears its declick threshold
-  // (reused verbatim: that package selects its declick branch at score > 12).
-  const CLICK_ON = 12
-  if (analysis.clicks > CLICK_ON) {
+  // 4. declick — only if denoise-detect's own click rate clears its declick threshold
+  // (CLICK_RATE, the one that package selects its declick branch at).
+  if (analysis.clicks > CLICK_RATE) {
     stages.push({
       atom: '@audio/denoise-declick', name: 'declick',
       params: { order: 60, windowSize: 1024, hopSize: 512, threshold: 4, guard: 2, maxBurst: 64 },
-      why: `impulsive clicks — AR-residual kurtosis ${analysis.clicks.toFixed(1)} (> ${CLICK_ON} trigger)`,
+      why: `impulsive clicks — ${analysis.clicks.toFixed(1)} a second (> ${CLICK_RATE} trigger)`,
     })
   }
 

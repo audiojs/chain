@@ -130,7 +130,7 @@ function dirtySpeech() {
 // near 5 kHz; needed for test 7's LTAS-slope measurement to mean anything). No hum, no
 // noise floor, no clicks: the percussive hit's short (4 ms) linear attack before the
 // exponential decay matters — an instant-onset decay reads as a broadband click to the
-// AR-residual kurtosis detector (denoise-detect's own declick trigger), which a few ms of
+// impulse detector (denoise-detect's own declick trigger), which a few ms of
 // ramp avoids. {period, attack, decay, amp} were picked by grid search for the lowest
 // click score comfortably under the declick threshold (12) with a healthy (~9 dB) crest.
 function cleanMusic() {

@@ -17,7 +17,7 @@ for (const s of recipe.stages) console.log(`${s.name.padEnd(9)} ${s.why}`)
 // hpf       DC/rumble guard, always applied — 40 Hz highpass (speech convention)
 // dehum     mains hum at 60 Hz, 24.0 dB above local floor (>=10 dB trigger)
 // denoise   noise floor -45.6 dB (> -60 dB trigger), severity 72%
-// declick   impulsive clicks — AR-residual kurtosis 2170.9 (> 12 trigger)
+// declick   impulsive clicks — 2.6 a second (> 1 trigger)
 // deesser   sibilance 5.7 dB rel. 1-4 kHz band (> -8 dB trigger)
 // eq        spectral deviation from speech target curve, max 12.0 dB (>=1 dB trigger)
 // gain      loudness normalization: measured -17.3 LUFS -> target -16 LUFS
@@ -57,7 +57,7 @@ stage's own concern (vocal content → speech-side; full-mix bass/dynamics → m
 | `hpf` | `@audio/filter-biquad` (highpass) | always | — DC/rumble guard; 40 Hz for speech, 25 Hz for `musicLike` (preserves bass under a bed mix) |
 | `dehum` | `@audio/denoise-dehum` | `analysis.hum` truthy | inline Goertzel, fundamental + 2 harmonics at 50 Hz and 60 Hz vs. a ±15 Hz off-tone floor; reports the stronger candidate once it clears **≥10 dB** above that floor |
 | `denoise` | `@audio/denoise-wiener` | `noiseFloorDb > -60` | `noiseFloorDb` (median noise-PSD bin power, dB) — severity maps `-60 → -40` dB to light → strong, scaled further by `intensity` |
-| `declick` | `@audio/denoise-declick` | `clicks > 12` | `analysis.clicks` — **reused from `@audio/denoise-detect`'s own classifier** (AR-residual excess kurtosis), same threshold (12) it uses to pick its own declick branch |
+| `declick` | `@audio/denoise-declick` | `clicks > CLICK_RATE` (1 a second) | `analysis.clicks` — **reused from `@audio/denoise-detect`'s own classifier** (impulses per second that stand out of the AR residual and have no like one pitch period away), with the threshold it uses to pick its own declick branch |
 | `deesser` | `@audio/dynamics-deesser` | `speechLike && sibilanceDb > -8` | `sibilanceDb` — 5-9 kHz vs. 1-4 kHz LTAS band ratio, dB |
 | `eq` | `@audio/eq-fir` | `max\|correction\| >= 1 dB` (post-intensity) | `deviation(ltas, targetCurve)` from `@audio/spectral-target`, octave-smoothed (broader than the kernel's own 1/3-oct default — a broad-strokes mastering correction, not a surgical one) and clamped ±12 dB |
 | `multiband` | `@audio/dynamics-multiband` | `musicLike \|\| (speechLike && lra > 12)` | `analysis.lra` for the speech branch; unconditional (content-type preset) for `musicLike`. 2-band (`speechLike`) or 3-band (`musicLike`) split; downward-only (`upRatio: 1`), ratio capped at 2 — "light glue" |
