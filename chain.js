@@ -4,16 +4,14 @@
 // Dolby/iZotope hide), apply() executes it, code() exports it as copy-paste runnable JS.
 //
 // Every stage below is a shipped @audio/* atom — this package is pure orchestration: no
-// DSP kernel lives here except the two genuinely trivial ones (gain multiply, inline
-// Goertzel for hum) that don't warrant their own published atom.
+// DSP kernel lives here except the one genuinely trivial one (gain multiply) that
+// doesn't warrant its own published atom.
 
 import lufsFn from '@audio/loudness-lufs'
 import truepeakFn from '@audio/loudness-truepeak'
 import lraFn from '@audio/loudness-lra'
-import { minStats } from '@audio/noise-estimate'
-import { stftAnalyse } from '@audio/stft'
 import { vad } from '@audio/vad'
-import { classify, CLICK_RATE } from '@audio/denoise-detect'
+import { classify, CLICK_RATE, BED_SNR } from '@audio/denoise-detect'
 import ltasFn from '@audio/spectral-ltas'
 import targetCurve, { deviation } from '@audio/spectral-target'
 import dehum from '@audio/denoise-dehum'
@@ -26,10 +24,6 @@ import firEq, { design as designFir } from '@audio/eq-fir'
 import highpass from '@audio/filter-biquad/highpass'
 import { encode as msEncode, decode as msDecode } from '@audio/spatial-midside'
 
-// Noise-PSD analysis window — pinned to denoise-wiener's own defaults (frameSize 2048,
-// hopSize 512 ⇒ half+1 = 1025 bins) so the profile analyze() builds slots straight into
-// that kernel's `profile` option with no bin-count mismatch.
-const NOISE_N = 2048, NOISE_HOP = 512
 // LTAS analysis window — spectral-ltas / spectral-target's own shared default
 // (bins = 4096/2+1 = 2049), so target()/deviation() need no explicit `bins` override.
 const LTAS_FRAME = 4096
@@ -46,47 +40,6 @@ function toMono(channels) {
   const mono = new Float32Array(n)
   for (const ch of channels) for (let i = 0; i < n; i++) mono[i] += ch[i] / channels.length
   return mono
-}
-
-function median(arr) {
-  const a = Float64Array.from(arr)
-  a.sort()
-  const n = a.length
-  if (!n) return 0
-  return n % 2 ? a[(n - 1) / 2] : (a[n / 2 - 1] + a[n / 2]) / 2
-}
-
-// Goertzel power at a single frequency — a 10-line inline DFT bin, cheaper than pulling
-// fourier-transform in just for two-tone hum detection. Same technique
-// @audio/denoise-detect uses internally for its own (hit-count) hum classifier; here it
-// feeds an actual dB-above-floor measurement instead of a threshold count.
-function goertzelPower(data, f, fs) {
-  const w = 2 * Math.PI * f / fs, c = 2 * Math.cos(w)
-  let s1 = 0, s2 = 0
-  for (let i = 0; i < data.length; i++) { const s = data[i] + c * s1 - s2; s2 = s1; s1 = s }
-  return (s1 * s1 + s2 * s2 - c * s1 * s2) / data.length
-}
-
-// Mains hum: fundamental + 2 harmonics (3 tones) at 50 Hz and 60 Hz, each measured
-// against its own ±15 Hz off-tone floor — avoids the FFT-bin leakage / self-contamination
-// a PSD-bin lookup would have this close to DC. Reports the stronger candidate once it
-// clears ~10 dB above the local floor.
-function detectHum(mono, fs) {
-  const chunk = mono.length > 16384 ? mono.subarray(0, 16384) : mono
-  const scan = (f0) => {
-    let on = 0, off = 0, n = 0
-    for (let h = 1; h <= 3; h++) {
-      const f = f0 * h
-      if (f > fs / 2 - 50 || f - 15 < 1) break
-      on += goertzelPower(chunk, f, fs)
-      off += Math.max((goertzelPower(chunk, f - 15, fs) + goertzelPower(chunk, f + 15, fs)) / 2, 1e-30)
-      n++
-    }
-    return n ? 10 * Math.log10(on / off) : -Infinity
-  }
-  const db50 = scan(50), db60 = scan(60)
-  const [freq, db] = db60 >= db50 ? [60, db60] : [50, db50]
-  return db >= 10 ? { freq, db } : null
 }
 
 // Runs of consecutive |x| >= 0.999 (>=2 samples), summed across channels.
@@ -142,36 +95,30 @@ export function analyze(channels, { fs = 44100 } = {}) {
   const truePeakDb = truepeakFn(channels, { fs })
   const lra = lraFn(channels, { fs })
 
-  // Noise PSD — Minimum Statistics (Martin 2001), tracked across the whole take so it
-  // reflects quiet frames wherever they fall, not just a leading "noise-only" prefix.
-  const half = NOISE_N >> 1
-  const est = minStats(half, {})
-  stftAnalyse(mono, mag => est.update(mag), { frameSize: NOISE_N, hopSize: NOISE_HOP })
-  const noisePsd = Float32Array.from(est.psd)
-  const noiseFloorDb = 10 * Math.log10(Math.max(median(est.psd), 1e-12))
-
   const ltas = ltasFn(mono, { frameSize: LTAS_FRAME })
   const sibilanceDb = 20 * Math.log10(
     Math.max(bandMean(ltas, fs, LTAS_FRAME, 5000, 9000), 1e-12) /
     Math.max(bandMean(ltas, fs, LTAS_FRAME, 1000, 4000), 1e-12)
   )
 
-  const hum = detectHum(mono, fs)
   const clipping = detectClipping(channels)
 
-  // Reuse denoise-detect's own classifier for the click score rather than re-deriving
-  // its impulse rate: plan() triggers declick on its own threshold (CLICK_RATE).
-  const { scores } = classify(Float32Array.from(mono), fs)
-  const clicks = scores.click
+  // The defects, by @audio/denoise-detect's evidence (its README has the confusion matrix):
+  // each needs positive evidence, so a clean take reads no hum, no clicks and no bed. Its
+  // routing is a priority order; its scores are independent, and plan() reads each. Hum is
+  // dehum's own measurement, A-weighted against the program (method 'dehum' is first in the
+  // order, so it is exactly the audible-hum verdict).
+  const { method, scores } = classify(mono, fs)
+  const hum = method === 'dehum' ? { freq: scores.humFreq, harmonics: scores.hum, level: scores.humLevel } : null
+  const clicks = scores.click, snr = scores.snr
 
-  const { active } = vad(Float32Array.from(mono), { fs })
-  const voicedRatio = active.length ? active.reduce((a, b) => a + b, 0) / active.length : 0
+  const { voiced } = vad(mono, { fs })
+  const voicedRatio = voiced.length ? voiced.reduce((a, b) => a + b, 0) / voiced.length : 0
 
   const analysis = {
     fs, duration, channels: channels.length,
     lufs, truePeakDb, lra,
-    noiseFloorDb, noisePsd,
-    ltas, sibilanceDb,
+    snr, ltas, sibilanceDb,
     hum, clipping, clicks, voicedRatio,
   }
   // Stereo width — only meaningful (and only cheap) for >=2 channels; consumed by
@@ -209,51 +156,48 @@ export function plan(analysis, opts = {}) {
     why: `DC/rumble guard, always applied — ${hpfHz} Hz highpass (${type} convention)`,
   })
 
-  // 2. dehum — only if a mains candidate cleared the floor (detectHum's ~10 dB trigger).
+  // 2. dehum — only on denoise-detect's hum verdict. dehum measures the series' exact
+  // frequency itself (within ±0.4 % of `freq`) and takes every harmonic up to 1 kHz.
   if (analysis.hum) {
+    const { freq, harmonics, level } = analysis.hum
     stages.push({
       atom: '@audio/denoise-dehum', name: 'dehum',
-      params: { freq: analysis.hum.freq, harmonics: 4, Q: 30 },
-      why: `mains hum at ${analysis.hum.freq} Hz, ${analysis.hum.db.toFixed(1)} dB above local floor (>=10 dB trigger)`,
+      params: { freq },
+      why: `mains hum at ${freq.toFixed(2)} Hz, ${harmonics} lines, ${level.toFixed(1)} dB(A) re the program (audible: denoise-detect's dehum verdict)`,
     })
   }
 
-  // 3. denoise — only once the noise floor clears -60 dB. Strength scales with both how
-  // bad the floor is (-60 -> -40 dB maps light -> strong severity) and `intensity`.
-  const NOISE_FLOOR_ON = -60, NOISE_FLOOR_MAX = -40
-  if (analysis.noiseFloorDb > NOISE_FLOOR_ON) {
-    const severity = clamp((analysis.noiseFloorDb - NOISE_FLOOR_ON) / (NOISE_FLOOR_MAX - NOISE_FLOOR_ON), 0, 1)
-    const xiFloor = clamp(-10 - 15 * severity * intensity, -30, -2)
+  // 3. denoise — only on a noise bed within BED_SNR of the program, shown in its pauses or
+  // steady bands. wiener tracks the bed itself (minimum statistics, Martin 2001), so a bed
+  // that changes over the take is followed. `intensity` scales the a priori SNR floor in dB
+  // from the kernel's −15 dB (lower left more musical noise and cost PESQ: wiener's README).
+  if (analysis.snr < BED_SNR) {
     stages.push({
       atom: '@audio/denoise-wiener', name: 'denoise',
-      params: {
-        rule: 'mmse-lsa', alphaDD: 0.98, xiFloor,
-        frameSize: NOISE_N, hopSize: NOISE_HOP,
-        profile: Array.from(analysis.noisePsd),
-      },
-      why: `noise floor ${analysis.noiseFloorDb.toFixed(1)} dB (> ${NOISE_FLOOR_ON} dB trigger), severity ${Math.round(severity * 100)}%`,
+      params: { xiFloor: clamp(-15 * intensity, -30, -2) },
+      why: `noise bed ${analysis.snr.toFixed(1)} dB under the program (< ${BED_SNR} dB trigger)`,
     })
   }
 
   // 4. declick — only if denoise-detect's own click rate clears its declick threshold
-  // (CLICK_RATE, the one that package selects its declick branch at).
+  // (CLICK_RATE, the one that package selects its declick branch at). Kernel defaults.
   if (analysis.clicks > CLICK_RATE) {
     stages.push({
       atom: '@audio/denoise-declick', name: 'declick',
-      params: { order: 60, windowSize: 1024, hopSize: 512, threshold: 4, guard: 2, maxBurst: 64 },
+      params: {},
       why: `impulsive clicks — ${analysis.clicks.toFixed(1)} a second (> ${CLICK_RATE} trigger)`,
     })
   }
 
   // 5. deesser — speech-bearing types only, only once sibilance clears the mid-band
-  // ratio. The deesser's own threshold param tightens with how far sibilance overshoots.
+  // ratio. The kernel judges each 's' itself (its band over the voice body, dB, against
+  // its tuned threshold) and cuts by how far it rises; `intensity` scales the deepest cut
+  // from its −6 dB `range`, past which an 's' turns into a lisp (dynamics-deesser README).
   const SIB_ON = -8
   if (speechLike && analysis.sibilanceDb > SIB_ON) {
-    const excess = analysis.sibilanceDb - SIB_ON
-    const threshold = clamp(-20 - excess * intensity, -40, -8)
     stages.push({
       atom: '@audio/dynamics-deesser', name: 'deesser',
-      params: { mode: 'band', freq: 6500, q: 1.4, threshold, ratio: 4 },
+      params: { mode: 'band', range: -6 * intensity || 0 },   // || 0: no −0 in the recipe
       why: `sibilance ${analysis.sibilanceDb.toFixed(1)} dB rel. 1-4 kHz band (> ${SIB_ON} dB trigger)`,
     })
   }
@@ -324,14 +268,15 @@ export function plan(analysis, opts = {}) {
     why: `loudness normalization: measured ${measured.toFixed(1)} LUFS -> target ${targetLufs} LUFS`,
   })
 
-  // 8 in the stage catalog — always, true-peak ceiling. Reference mode tightens the
-  // ceiling to the reference's own true peak when that's the lower (safer) bound.
+  // 8 in the stage catalog — always, peak ceiling (sample peaks: dynamics-limiter does not
+  // constrain inter-sample peaks, which pass it by a fraction of a dB). Reference mode
+  // tightens the ceiling to the reference's own true peak when that's the lower bound.
   let ceiling = opts.ceiling ?? -1
   if (reference && reference.truePeakDb != null) ceiling = Math.min(ceiling, reference.truePeakDb)
   stages.push({
     atom: '@audio/dynamics-limiter', name: 'limiter',
     params: { ceiling, lookahead: 5, release: 50 },
-    why: `true-peak ceiling ${ceiling.toFixed(1)} dBTP, always applied${reference ? ' (matched to reference)' : ''}`,
+    why: `peak ceiling ${ceiling.toFixed(1)} dB, always applied${reference ? ' (matched to reference true peak)' : ''}`,
   })
 
   return { fs, type, intensity, targetLufs, stages }
@@ -346,21 +291,16 @@ function runStage(stage, out, fs) {
       for (let c = 0; c < out.length; c++) out[c] = highpass(out[c], { fc: p.fc, order: p.order, Q: p.Q, fs })
       break
     case 'dehum':
-      for (let c = 0; c < out.length; c++) out[c] = dehum(out[c], { freq: p.freq, harmonics: p.harmonics, Q: p.Q, fs })
+      for (let c = 0; c < out.length; c++) out[c] = dehum(out[c], { freq: p.freq, fs })
       break
     case 'denoise':
-      for (let c = 0; c < out.length; c++)
-        out[c] = wiener(out[c], {
-          profile: p.profile, frameSize: p.frameSize, hopSize: p.hopSize, fs,
-          rule: p.rule, alphaDD: p.alphaDD, xiMin: 10 ** (p.xiFloor / 10),
-        })
+      for (let c = 0; c < out.length; c++) out[c] = wiener(out[c], { fs, xiMin: 10 ** (p.xiFloor / 10) })
       break
     case 'declick':
-      for (let c = 0; c < out.length; c++) out[c] = declick(out[c], p)
+      for (let c = 0; c < out.length; c++) out[c] = declick(out[c], { ...p, fs })
       break
     case 'deesser':
-      for (let c = 0; c < out.length; c++)
-        out[c] = deesser(out[c], { sampleRate: fs, mode: p.mode, freq: p.freq, q: p.q, threshold: p.threshold, ratio: p.ratio })
+      for (let c = 0; c < out.length; c++) out[c] = deesser(out[c], { ...p, sampleRate: fs })
       break
     case 'eq': {
       const correction = Float32Array.from(p.correction)
@@ -445,8 +385,8 @@ export default function chain(channels, opts = {}) {
 
 // Exports the recipe as copy-paste runnable ESM: imports of each stage's atom, then the
 // stages applied in order with the exact params the recipe carries (including embedded
-// derived data — the noise profile, the EQ correction curve — so the script reproduces
-// the render without re-analyzing anything).
+// derived data — the EQ correction curve), then apply()'s refinement pass: the script
+// renders what apply() renders, bit for bit, without re-analyzing anything.
 export function code(recipe) {
   const fs = recipe.fs
   const seen = new Set()
@@ -464,19 +404,19 @@ export function code(recipe) {
         break
       case 'dehum':
         addImport(`import dehum from '@audio/denoise-dehum'`)
-        bodyLines.push(`for (const ch of channels) dehum(ch, ${JSON.stringify({ freq: p.freq, harmonics: p.harmonics, Q: p.Q, fs })})`)
+        bodyLines.push(`for (const ch of channels) dehum(ch, ${JSON.stringify({ freq: p.freq, fs })})`)
         break
       case 'denoise':
         addImport(`import wiener from '@audio/denoise-wiener'`)
-        bodyLines.push(`channels.forEach((ch, i) => { channels[i] = wiener(ch, { profile: ${JSON.stringify(p.profile)}, frameSize: ${p.frameSize}, hopSize: ${p.hopSize}, fs, rule: ${JSON.stringify(p.rule)}, alphaDD: ${p.alphaDD}, xiMin: ${10 ** (p.xiFloor / 10)} }) })`)
+        bodyLines.push(`channels.forEach((ch, i) => { channels[i] = wiener(ch, { fs: ${fs}, xiMin: 10 ** (${p.xiFloor} / 10) }) })`)
         break
       case 'declick':
         addImport(`import declick from '@audio/denoise-declick'`)
-        bodyLines.push(`channels.forEach((ch, i) => { channels[i] = declick(ch, ${JSON.stringify(p)}) })`)
+        bodyLines.push(`channels.forEach((ch, i) => { channels[i] = declick(ch, ${JSON.stringify({ ...p, fs })}) })`)
         break
       case 'deesser':
         addImport(`import deesser from '@audio/dynamics-deesser'`)
-        bodyLines.push(`channels.forEach((ch, i) => { channels[i] = deesser(ch, ${JSON.stringify({ sampleRate: fs, mode: p.mode, freq: p.freq, q: p.q, threshold: p.threshold, ratio: p.ratio })}) })`)
+        bodyLines.push(`channels.forEach((ch, i) => { channels[i] = deesser(ch, ${JSON.stringify({ ...p, sampleRate: fs })}) })`)
         break
       case 'eq':
         addImport(`import firEq, { design } from '@audio/eq-fir'`)
@@ -502,7 +442,7 @@ export function code(recipe) {
         bodyLines.push(`if (channels.length >= 2) { encode([channels[0], channels[1]]); decode([channels[0], channels[1]], ${JSON.stringify({ width: p.width })}) }`)
         break
       case 'gain':
-        bodyLines.push(`{ const g = ${10 ** (p.db / 20)}; for (const ch of channels) for (let i = 0; i < ch.length; i++) ch[i] *= g }`)
+        bodyLines.push(`{ const g = 10 ** (${p.db} / 20); for (const ch of channels) for (let i = 0; i < ch.length; i++) ch[i] *= g }`)
         break
       case 'limiter':
         addImport(`import limiter from '@audio/dynamics-limiter'`)
@@ -510,6 +450,23 @@ export function code(recipe) {
         break
     }
     bodyLines.push('')
+  }
+
+  // apply()'s refinement pass: loudness re-measured once, a <= ±2 dB trim, the limiter again
+  const lim = recipe.stages.find(s => s.name === 'limiter')
+  if (lim) {
+    addImport(`import lufs from '@audio/loudness-lufs'`)
+    bodyLines.push(`// trim — loudness re-measured, trimmed <= ±2 dB to ${recipe.targetLufs} LUFS, re-limited (apply()'s refinement pass)`)
+    bodyLines.push([
+      `{`,
+      `  const m = lufs(channels, { fs }), trim = Math.max(-2, Math.min(2, ${recipe.targetLufs} - m))`,
+      `  if (Number.isFinite(m) && Math.abs(trim) > 0.01) {`,
+      `    const g = 10 ** (trim / 20)`,
+      `    for (const ch of channels) for (let i = 0; i < ch.length; i++) ch[i] *= g`,
+      `    channels.forEach((ch, i) => { channels[i] = limiter(ch, ${JSON.stringify({ sampleRate: fs, ceiling: lim.params.ceiling, lookahead: lim.params.lookahead, release: lim.params.release })}) })`,
+      `  }`,
+      `}`,
+    ].join('\n'))
   }
 
   return `// audiojs recipe — generated by @audio/chain
