@@ -56,7 +56,7 @@ stage's own concern (vocal content → speech-side; full-mix bass/dynamics → m
 |---|---|---|---|
 | `hpf` | `@audio/filter-biquad` (highpass) | always | — DC/rumble guard; 40 Hz for speech, 25 Hz for `musicLike` (preserves bass under a bed mix) |
 | `dehum` | `@audio/denoise-dehum` | `analysis.hum` truthy | **`@audio/denoise-detect`'s hum verdict**: dehum's own measurement finds a 50 or 60 Hz series, A-weighted within 50 dB of the program. `{ freq }`: dehum measures the exact frequency within ±0.4 % and subtracts every harmonic up to 1 kHz |
-| `denoise` | `@audio/denoise-wiener` | `snr < BED_SNR` (25 dB) | **`@audio/denoise-detect`'s noise bed**: a floor shown in the program's pauses or in steady bands, its level re the program. MMSE-LSA, the bed tracked by minimum statistics, so one that changes over the take is followed; `{ xiFloor }`, the a priori SNR floor in dB |
+| `denoise` | `@audio/denoise-omlsa` | `snr < BED_SNR` (25 dB) | **`@audio/denoise-detect`'s noise bed**: a floor shown in the program's pauses or held at its bands' floor, its level re the program. OM-LSA, the bed tracked by IMCRA, so one that changes over the take is followed and held notes are not learned; `{ gMin }`, the floor the noise is taken to, dB |
 | `declick` | `@audio/denoise-declick` | `clicks > CLICK_RATE` (1 a second) | **`@audio/denoise-detect`'s click rate** (isolated impulses standing 32σ out of the AR error), with the threshold it picks its own declick branch at. The kernel's defaults |
 | `deesser` | `@audio/dynamics-deesser` | `speechLike && sibilanceDb > -8` | `sibilanceDb` — 5-9 kHz vs. 1-4 kHz LTAS band ratio, dB. `{ mode: 'band', range }`: the kernel judges each 's' (its band over the voice body, against its own threshold); `range` −6 dB × intensity |
 | `eq` | `@audio/eq-fir` | `max\|correction\| >= 1 dB` (post-intensity) | `deviation(ltas, targetCurve)` from `@audio/spectral-target`, octave-smoothed (broader than the kernel's own 1/3-oct default — a broad-strokes mastering correction, not a surgical one) and clamped ±12 dB |
@@ -101,7 +101,7 @@ under, mains hum 20 dB under, clicks at 5× the level around. The triggers are
 0.1.1 denoised every speech take: its trigger, a noise floor over −60 dB on an unnormalized FFT
 scale, is an absolute level any real recording clears; and it put declick into 38 % of clean
 VoiceBank takes. Its wiener ran on a noise profile frozen from the take's last second of minimum
-statistics, wrong wherever the bed changes over the take; wiener now tracks it (its default).
+statistics, wrong wherever the bed changes over the take; 0.3 runs omlsa, as denoise-detect 0.5 routes every bed, its IMCRA tracking it and leaving held notes out.
 Missed now: noise that holds a line through the pauses (the test set's bus noise, office and
 living-room noise at 12.5–17.5 dB), as denoise-detect's README states. Tuning set (VoiceBank's
 training subset, ten other narrations, repair/ music and other singers): clean speech untouched

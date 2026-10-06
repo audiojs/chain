@@ -15,7 +15,7 @@ import { classify, CLICK_RATE, BED_SNR } from '@audio/denoise-detect'
 import ltasFn from '@audio/spectral-ltas'
 import targetCurve, { deviation } from '@audio/spectral-target'
 import dehum from '@audio/denoise-dehum'
-import wiener from '@audio/denoise-wiener'
+import omlsa from '@audio/denoise-omlsa'
 import declick from '@audio/denoise-declick'
 import deesser from '@audio/dynamics-deesser'
 import multiband from '@audio/dynamics-multiband'
@@ -167,14 +167,15 @@ export function plan(analysis, opts = {}) {
     })
   }
 
-  // 3. denoise — only on a noise bed within BED_SNR of the program, shown in its pauses or
-  // steady bands. wiener tracks the bed itself (minimum statistics, Martin 2001), so a bed
-  // that changes over the take is followed. `intensity` scales the a priori SNR floor in dB
-  // from the kernel's −15 dB (lower left more musical noise and cost PESQ: wiener's README).
+  // 3. denoise — only on a noise bed within BED_SNR of the program, shown in its pauses or held
+  // at its bands' floor. omlsa, as denoise-detect routes every bed (STOI +0.007 over wiener on
+  // ~1000 takes: its README), tracks the bed itself (IMCRA, Cohen 2003), so a bed that changes
+  // over the take is followed, held notes not learned. `intensity` scales the floor the noise
+  // is taken to from the kernel's −15 dB.
   if (analysis.snr < BED_SNR) {
     stages.push({
-      atom: '@audio/denoise-wiener', name: 'denoise',
-      params: { xiFloor: clamp(-15 * intensity, -30, -2) },
+      atom: '@audio/denoise-omlsa', name: 'denoise',
+      params: { gMin: clamp(-15 * intensity, -30, -2) },
       why: `noise bed ${analysis.snr.toFixed(1)} dB under the program (< ${BED_SNR} dB trigger)`,
     })
   }
@@ -294,7 +295,7 @@ function runStage(stage, out, fs) {
       for (let c = 0; c < out.length; c++) out[c] = dehum(out[c], { freq: p.freq, fs })
       break
     case 'denoise':
-      for (let c = 0; c < out.length; c++) out[c] = wiener(out[c], { fs, xiMin: 10 ** (p.xiFloor / 10) })
+      for (let c = 0; c < out.length; c++) out[c] = omlsa(out[c], { fs, gMin: p.gMin })
       break
     case 'declick':
       for (let c = 0; c < out.length; c++) out[c] = declick(out[c], { ...p, fs })
@@ -407,8 +408,8 @@ export function code(recipe) {
         bodyLines.push(`for (const ch of channels) dehum(ch, ${JSON.stringify({ freq: p.freq, fs })})`)
         break
       case 'denoise':
-        addImport(`import wiener from '@audio/denoise-wiener'`)
-        bodyLines.push(`channels.forEach((ch, i) => { channels[i] = wiener(ch, { fs: ${fs}, xiMin: 10 ** (${p.xiFloor} / 10) }) })`)
+        addImport(`import omlsa from '@audio/denoise-omlsa'`)
+        bodyLines.push(`channels.forEach((ch, i) => { channels[i] = omlsa(ch, { fs: ${fs}, gMin: ${p.gMin} }) })`)
         break
       case 'declick':
         addImport(`import declick from '@audio/denoise-declick'`)

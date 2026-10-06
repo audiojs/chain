@@ -84,7 +84,7 @@ function median(arr) {
 //    the 50 and 60 Hz series dehum removes up to 1 kHz. A steady synthetic partial on a mains
 //    harmonic is a line to dehum (150 Hz = 3 x 50; 220 Hz put its 3rd on 660 = 11 x 60),
 //    and goes with the hum.
-//  - Syllable rate is 2 Hz, not ~4 Hz: 250 ms gaps, several times denoise-wiener's ~23 ms
+//  - Syllable rate is 2 Hz, not ~4 Hz: 250 ms gaps, several times denoise-omlsa's ~23 ms
 //    frame, so the gap-floor measurement in test 5 reads settled frames, not the STFT-smeared
 //    edges of the syllables around them.
 function speech({ hum = true, noise = true, clicks = true } = {}) {
@@ -170,7 +170,7 @@ function goertzelDb(data, f, fs) {
 }
 
 // Robust silence-gap floor: every syllable-silence window (t mod 0.5 in (0.25,0.5), see
-// speech), a 60 ms margin trimmed off each edge (clear of denoise-wiener's ~23 ms STFT
+// speech), a 60 ms margin trimmed off each edge (clear of denoise-omlsa's ~23 ms STFT
 // frame), median dB across all gaps rather than one arbitrary window.
 function gapFloorsDb(d, fs) {
   const period = 0.5, silStart = 0.25, silEnd = 0.5, margin = 0.06
@@ -273,7 +273,7 @@ test('plan(clean speech) repairs nothing: no hum, no bed, no clicks evidenced', 
 test('each defect alone puts in its own stage, with the kernels\' current params, and that stage repairs it', () => {
   for (const [defect, name, check] of [
     ['hum', 'dehum', p => { assert.deepEqual(Object.keys(p), ['freq']); assert.ok(Math.abs(p.freq - 60) < 0.3, `freq ${p.freq}`) }],
-    ['noise', 'denoise', p => assert.deepEqual(p, { xiFloor: -15 })],
+    ['noise', 'denoise', p => assert.deepEqual(p, { gMin: -15 })],
     ['clicks', 'declick', p => assert.deepEqual(p, {})],
   ]) {
     const x = speech({ hum: false, noise: false, clicks: false, [defect]: true }), st = repairs(x)
@@ -287,10 +287,10 @@ test('each defect alone puts in its own stage, with the kernels\' current params
   }
 })
 
-test('intensity scales denoise\'s a priori SNR floor and the deesser\'s deepest cut, not whether they fire', () => {
-  for (const [intensity, xiFloor, range] of [[0, -2, 0], [0.5, -7.5, -3], [1, -15, -6], [2, -30, -12]]) {
+test('intensity scales denoise\'s floor and the deesser\'s deepest cut, not whether they fire', () => {
+  for (const [intensity, gMin, range] of [[0, -2, 0], [0.5, -7.5, -3], [1, -15, -6], [2, -30, -12]]) {
     const st = plan(aDirty, { type: 'speech', intensity }).stages, by = n => st.find(s => s.name === n).params
-    assert.equal(by('denoise').xiFloor, xiFloor, `intensity ${intensity}: xiFloor`)
+    assert.equal(by('denoise').gMin, gMin, `intensity ${intensity}: gMin`)
     assert.equal(by('deesser').mode, 'band')
     assert.equal(by('deesser').range, range, `intensity ${intensity}: range`)
     assert.equal(by('deesser').threshold, undefined, 'the kernel\'s own threshold (sibilance band over the voice body)')
