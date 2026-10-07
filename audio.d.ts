@@ -44,6 +44,27 @@ export declare const auto: {
   }
 }
 
+/** A recipe stage: the atom it runs, its params, the measurement that put it there */
+export interface Stage { atom: string, name: string, params: Record<string, unknown>, why: string }
+export interface Recipe { fs: number, type: 'speech' | 'music' | 'voice-music', intensity: number, targetLufs: number, stages: Stage[] }
+export interface PlanOptions {
+  type?: 'speech' | 'music' | 'voice-music'
+  intensity?: number
+  targetLufs?: number
+  ceiling?: number
+  reference?: Record<string, unknown>
+  /** its caller runs @audio/neural-denoise: a speech bed goes to DeepFilterNet3 (a stage apply() can't run, code() awaits);
+   *  `music`: the share the model's guard passed as music where the stage runs (over half: OM-LSA instead) */
+  neural?: boolean | { music?: number }
+}
+/** For a host that runs the recipe itself (chain.js's own) */
+export declare function analyze(channels: Float32Array[] | Float32Array, opts?: { fs?: number, type?: PlanOptions['type'] }): Record<string, any>
+export declare function plan(analysis: Record<string, any>, opts?: PlanOptions): Recipe
+export declare function apply(channels: Float32Array[] | Float32Array, recipe: Recipe, opts?: { fs?: number }): Float32Array[]
+export declare function code(recipe: Recipe): string
+/** plan()'s options from the params as a host hands them over (a number or its 1-length array): targetLufs 0, the sentinel, none */
+export declare function options(params: Record<string, unknown>): PlanOptions
+
 /** Stat plugin 'chain' — whole-signal analysis, registers as a.stat('chain') */
 export declare const chain: {
   stat: 'chain'

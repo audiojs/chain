@@ -30,19 +30,20 @@ for (const s of recipe.stages) console.log(`${s.name.padEnd(9)} ${s.why}`)
 |---|---|---|
 | `analyze` | `analyze(channels, { fs=44100, type })` | Read-only measurement pass. Returns a plain object: `fs, duration, channels, lufs, truePeakDb, lra, snr, ltas, sibilanceDb, hum, clipping, clicks, voicedRatio, reverb, pops`, plus `width` when `channels.length >= 2`. `snr`: program over noise bed, dB (`Infinity`: no bed); `hum`: `{ freq, harmonics, level, taken }` or `null` (`taken`: what dehum's own detection took, dB re the take; `freq`, `harmonics`, `level`: denoise-detect's measured series, its A-weighted level re the program, when it found one); `clipping`: `{ count, ratio, level, kind }`, declip's evidence (`kind` `'rail'`, `'band'` or `null`; `level` the lowest rail, dBFS); `clicks`: impulses a second; `voicedRatio`: share of voiced frames (`@audio/vad`); `reverb`, `pops`: `{ db, spans }` that dereverb and deplosive take from the take, or `null` (read for `type` `'speech'` only, the default). |
 | `plan` | `plan(analysis, opts)` | Analysis → recipe: `{ fs, type, intensity, targetLufs, stages }`. Each stage is `{ atom, name, params, why }`. `JSON.stringify`-safe (no typed arrays). |
-| `apply` | `apply(channels, recipe, { fs=44100 })` | Executes `recipe.stages` in order over copies (input untouched), then, where a limiter runs, one refinement pass (see below). Returns `Float32Array[]`. |
+| `apply` | `apply(channels, recipe, { fs=44100 })` | Executes `recipe.stages` in order over copies (input untouched), then, where a limiter runs, one refinement pass (see below). Returns `Float32Array[]`. Throws on a neural stage (`neural`, below): it runs asynchronously, so its caller applies the stages before it, awaits it, and applies the rest. |
 | `chain` (default) | `chain(channels, opts)` | One-shot `analyze → plan → apply` → `{ channels, recipe, analysis }`. |
-| `code` | `code(recipe)` | Recipe → copy-paste runnable ESM: imports of every stage's atom + the exact params, executed in order, then `apply()`'s refinement pass. Embeds derived data (the EQ correction curve), so the script renders what `apply()` renders, bit for bit, without re-analyzing anything. |
+| `code` | `code(recipe)` | Recipe → copy-paste runnable ESM: imports of every stage's atom + the exact params, executed in order, then `apply()`'s refinement pass. Embeds derived data (the EQ correction curve), so the script renders what `apply()` renders, bit for bit, without re-analyzing anything. A neural stage is awaited (`await denoise(channel, { sampleRate, model, limit, floor })`, top-level await): the script names the denoiser that ran. |
 
 `plan()` options:
 
 | opt | default | meaning |
 |---|---|---|
 | `type` | `'speech'` | `'speech' \| 'music' \| 'voice-music'` |
-| `intensity` | `1` | `0..2`: scales how hard the adaptive stages work: denoise's a priori SNR floor (−15 dB × intensity, −2..−30), dereverb's late estimate (`strength` × intensity), the deesser's deepest cut (−8 dB × intensity), the EQ's correction past the spread, the multiband ratio, the limiting allowed to reach the loudness target (6 dB × intensity). Does not change *whether* a stage fires (that's measurement-only, see below); declip, declick, deplosive and dehum have no strength |
+| `intensity` | `1` | `0..2`: scales how hard the adaptive stages work: denoise's a priori SNR floor (−15 dB × intensity, −2..−30; with `neural`, how far DeepFilterNet3 takes the bed: 60 dB × intensity, 2 at least), dereverb's late estimate (`strength` × intensity), the deesser's deepest cut (−8 dB × intensity), the EQ's correction past the spread, the multiband ratio, the limiting allowed to reach the loudness target (6 dB × intensity). Does not change *whether* a stage fires (that's measurement-only, see below); declip, declick, deplosive and dehum have no strength |
 | `targetLufs` | per-type | override the loudness target (speech/voice-music `-16`, music `-14` — EBU-informed conventions) |
 | `reference` | — | `{ ltas, lufs, truePeakDb, width }`, typically `analyze()` of a reference track — see **Reference mode** |
 | `ceiling` | `-1` | peak ceiling override, dB |
+| `neural` | `false` | its caller runs [`@audio/neural-denoise`](https://github.com/audiojs/neural) (audio's `auto()` does where it is installed): a bed under speech goes to DeepFilterNet3 instead of OM-LSA (see `denoise` below). `{ music }`: the share of the take the model's guard passed as music where the stage runs, as its caller saw it; over half, OM-LSA (the model would leave the take as it came). This package neither imports nor runs it |
 
 ## Per-stage inclusion rules
 
@@ -62,7 +63,7 @@ reads as a room to one, a kick drum as a pop to the other).
 | `deplosive` | `@audio/denoise-deplosive` | `type === 'speech' && pops.db > -22` | **deplosive's own detection**, run in `analyze()` (on the take past declick, as the plan hands it on, here and for dehum and dereverb: a click reads to dereverb as a fall no room allows): a thump under 80 Hz rising out of nothing over the voice's band, without a period; what it takes, over −22 dB of the take (a voice's own low end at a word's onset takes less). The kernel's defaults |
 | `hpf` | `@audio/filter-biquad` (highpass) | always | DC/rumble guard; 40 Hz for speech, 20 Hz for `musicLike`, the bottom of hearing (0.3's 25 Hz took the sub-bass out of bass-heavy mixes: PEAQ ODG under −0.5 for 4 of 32 tuning mixes) |
 | `dehum` | `@audio/denoise-dehum` | `hum` | **dehum's own detection**, run in `analyze()`: its measurement over the take, else lines tracked along the 50 and 60 Hz series (hum under music); what it took. The kernel finds the series again, tracks its exact frequency, takes every harmonic to 1 kHz and every line over it to 8 kHz |
-| `denoise` | `@audio/denoise-omlsa` | `speechLike && snr < BED_SNR` (25 dB) | **`@audio/denoise-detect`'s noise bed**: a floor shown in the program's pauses or held at its bands' floor, its level re the program. OM-LSA, the bed tracked by IMCRA, so one that changes over the take is followed; `{ gMin }`, the floor the noise is taken to, dB. Not on music: tracking a dense mix it takes held parts of it for the bed (see Measured) |
+| `denoise` | `@audio/denoise-omlsa`; with `neural`, for `'speech'`, `@audio/neural-denoise` | `speechLike && snr < BED_SNR` (25 dB) | **`@audio/denoise-detect`'s noise bed**: a floor shown in the program's pauses or held at its bands' floor, its level re the program. OM-LSA, the bed tracked by IMCRA, so one that changes over the take is followed; `{ gMin }`, the floor the noise is taken to, dB. With `neural`: DeepFilterNet3 (Schröter et al., Interspeech 2023), `{ model: 'deepfilternet3', limit, floor }`, its output mixed back by the package's `mixback()`: the noise 60 dB × intensity down, no floor (at 60 dB no bed reaches one), a trace of the room left rather than digital silence; as much as its whole removal on the tuning takes (see Measured). Voice-music keeps OM-LSA (the model takes a music bed under a voice for noise), and so does a take the model's guard passes as music in its larger part (`neural: { music }`). Not on music: tracking a dense mix it takes held parts of it for the bed (see Measured) |
 | `dereverb` | `@audio/denoise-dereverb` | `type === 'speech' && reverb.db > -20` | **dereverb's own checks**, run in `analyze()`: a diffuse tail falling slower than the voice (dry, diffuse, pauses); what it takes, over −20 dB of the take (a reading's own mild room at home takes less). After the denoiser: a bed reads as a tail that never falls. `{ strength }`, the late estimate's scale × intensity |
 | `deesser` | `@audio/dynamics-deesser` | `speechLike && sibilanceDb > -6` | `sibilanceDb`: 5-9 kHz vs. 1-4 kHz LTAS band ratio, dB. `{ range }`, its default mode (`split`): the kernel judges each 's' (its band over the voice body, against its own threshold) and cuts the band over 3.5 kHz; `range` −8 dB × intensity |
 | `eq` | `@audio/eq-fir` | speech or reference mode, `max\|correction\| >= 1 dB` (post-intensity) | spectral-target's `deviation()`, Byrne's LTASS less the LTAS over 100 Hz–10 kHz, levelled per octave, octave-smoothed: only what lies past the spread clean voices keep about it (the largest deviation, per octave, of the tuning split's 61 clean speech takes: 6.9–12 dB), × intensity. Not on music: Pestana's slope is the average of commercial pop mixes, not of music (a solo trumpet lies 6–7 dB past their spread). A reference (reference mode) is matched whole |
@@ -103,28 +104,31 @@ tuning takes with its defect, then on for every take each module whose dropping 
 80 %, De-reverb 25 %, De-clip at −0.1 dB without its limiter, De-ess at its defaults (De-click off: on, it lowered the
 mean); music De-click and De-clip (De-noise lowered PEAQ's grade at every amount, −2.26 → −2.34 at 20 %, −2.90 at
 100 %). Oracle: the tuned modules on for each take's own defects, what a perfect analysis would set. Ours: the recipe's
-repairs alone (RX's scope), and `auto()` whole (with the EQ, glue, loudness and limiter).
+repairs alone (RX's scope), and `auto()` whole (with the EQ, glue, loudness and limiter), as audio's `auto()` runs them:
+0.5.0 with `@audio/neural-denoise` installed (a speech bed to DeepFilterNet3), 0.4.0 without it (OM-LSA), both on the
+current dependencies.
 
 Speech: PESQ (P.862.2), mean over the takes:
 
-| takes | input | RX tuned | RX oracle | 0.3.0 repairs | 0.3.0 `auto()` | **0.4.0 repairs** | **0.4.0 `auto()`** |
+| takes | input | RX tuned | RX oracle | 0.4.0 repairs | 0.4.0 `auto()` | **0.5.0 repairs** | **0.5.0 `auto()`** |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| clean (68) | 4.64 | 3.81 | 4.64 | 4.54 | 4.29 | 4.46 | 4.45 |
-| steady bed (9) | 1.81 | 2.94 | 2.95 | 2.39 | 2.15 | 2.39 | 2.38 |
-| DEMAND (9) | 1.84 | 2.90 | 2.93 | 2.03 | 1.83 | 2.07 | 2.04 |
-| hum, buzz (9) | 2.78 | 3.60 | 2.78 | 3.24 | 2.69 | 3.28 | 3.22 |
-| clicks (9) | 2.25 | 2.98 | 2.97 | 3.54 | 3.60 | 3.86 | 3.87 |
-| clipped (8) | 2.38 | 2.66 | 3.07 | 2.36 | 1.95 | 3.87 | 3.88 |
-| room (8) | 2.06 | 2.09 | 2.41 | 2.06 | 2.01 | 2.60 | 2.50 |
-| sibilance (8) | 4.44 | 3.74 | 4.58 | 4.52 | 4.35 | 4.52 | 4.49 |
-| pops (8) | 2.52 | 2.50 | 2.52 | 3.01 | 2.39 | 3.77 | 3.75 |
-| 2–4 defects (68) | 1.60 | 2.18 | 2.20 | 1.87 | 1.66 | 2.31 | 2.26 |
-| all with defects (136) | 2.04 | 2.56 | 2.61 | 2.38 | 2.14 | 2.79 | 2.75 |
-| … STOI | 0.90 | 0.91 | 0.92 | 0.91 | 0.91 | 0.93 | 0.93 |
-| … SI-SDR, dB | 9.3 | 13.0 | 13.7 | 14.7 | 12.1 | 18.2 | 14.9 |
-| … DNSMOS OVRL | 2.77 | 3.12 | 3.07 | 2.91 | 2.85 | 3.00 | 3.00 |
+| clean (68) | 4.64 | 3.81 | 4.64 | 4.46 | 4.45 | 4.46 | 4.45 |
+| steady bed (9) | 1.81 | 2.94 | 2.95 | 2.39 | 2.38 | 2.97 | 2.96 |
+| DEMAND (9) | 1.84 | 2.90 | 2.93 | 2.07 | 2.04 | 2.53 | 2.50 |
+| hum, buzz (9) | 2.78 | 3.60 | 2.78 | 3.28 | 3.22 | 3.29 | 3.23 |
+| clicks (9) | 2.25 | 2.98 | 2.97 | 3.86 | 3.87 | 3.86 | 3.87 |
+| clipped (8) | 2.38 | 2.66 | 3.07 | 3.87 | 3.88 | 3.87 | 3.88 |
+| room (8) | 2.06 | 2.09 | 2.41 | 2.60 | 2.50 | 2.60 | 2.50 |
+| sibilance (8) | 4.44 | 3.74 | 4.58 | 4.52 | 4.49 | 4.52 | 4.49 |
+| pops (8) | 2.52 | 2.50 | 2.52 | 3.77 | 3.75 | 3.77 | 3.75 |
+| 2–4 defects (68) | 1.60 | 2.18 | 2.20 | 2.31 | 2.26 | 2.57 | 2.53 |
+| all with defects (136) | 2.04 | 2.56 | 2.61 | 2.79 | 2.75 | 2.99 | 2.96 |
+| … STOI | 0.90 | 0.91 | 0.92 | 0.93 | 0.93 | 0.94 | 0.93 |
+| … SI-SDR, dB | 9.3 | 13.0 | 13.7 | 18.2 | 14.9 | 18.4 | 15.1 |
+| … DNSMOS OVRL | 2.77 | 3.12 | 3.07 | 3.00 | 3.00 | 3.12 | 3.12 |
 
-Music: PEAQ Basic ODG (ITU-R BS.1387), mean:
+Music: PEAQ Basic ODG (ITU-R BS.1387), mean (0.5.0 renders every music take as 0.4.0 does, sample for sample: no neural
+stage on music):
 
 | takes | input | RX tuned | RX oracle | 0.3.0 repairs | 0.3.0 `auto()` | **0.4.0 repairs** | **0.4.0 `auto()`** |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -139,13 +143,19 @@ Music: PEAQ Basic ODG (ITU-R BS.1387), mean:
 | … SI-SDR, dB | 16.0 | 15.0 | 14.0 | 18.3 | −14.9 | 22.3 | 17.8 |
 | … NMR, dB | −7.2 | −7.9 | −7.2 | −7.9 | 0.7 | −9.8 | −9.2 |
 
-Paired over the takes with defects, the repairs against RX tuned: speech PESQ +0.23 ± 0.14 (95 %), STOI +0.01 ± 0.01,
-SI-SDR +5.2 ± 1.1 dB, DNSMOS OVRL −0.12 ± 0.05; music ODG +0.54 ± 0.25, SI-SDR +7.3 ± 1.8 dB, NMR 1.9 ± 2.5 dB lower.
-Against RX oracle: speech PESQ +0.18 ± 0.13, SI-SDR +4.5 ± 1.2, OVRL −0.07 ± 0.05; music ODG +0.57 ± 0.25. RX leads
-where a bed is the defect: PESQ −0.55 ± 0.16 on the steady beds, −0.83 ± 0.35 on DEMAND's (OVRL −0.22, −0.36); its
-De-noise at 80 % takes more of a bed than OM-LSA's −15 dB floor (on the tuning takes a −20 dB floor or the noise read
-4 dB louder gained 0.01–0.03 PESQ a take for 0.01 of STOI). It takes hum as part of the bed too (PESQ
-+0.32 ± 0.56 over ours, which keeps the voice: SI-SDR 10.9 ± 4.6 dB over RX's). Clean takes: RX tuned runs its De-noise
+Paired over the takes with defects, 0.5.0's repairs against RX tuned: speech PESQ +0.43 ± 0.13 (95 %), STOI
++0.02 ± 0.01, SI-SDR +5.4 ± 1.0 dB, DNSMOS OVRL +0.00 ± 0.04; music ODG +0.54 ± 0.25, SI-SDR +7.3 ± 1.8 dB, NMR
+1.9 ± 2.5 dB lower. Against RX oracle: speech PESQ +0.38 ± 0.11, SI-SDR +4.7 ± 1.1, OVRL +0.05 ± 0.04; music ODG
++0.57 ± 0.25. 0.4.0 trailed RX where a bed is the defect: PESQ −0.56 ± 0.16 on the steady beds, −0.86 ± 0.35 on
+DEMAND's (OVRL −0.22, −0.35), OM-LSA's −15 dB floor leaving more of a bed than RX's De-noise at 80 % (on the tuning
+takes a −20 dB floor or the noise read 4 dB louder gained 0.01–0.03 PESQ a take for 0.01 of STOI). 0.5.0's
+DeepFilterNet3 takes the beds the plan finds: on the 49 takes it ran on, PESQ 1.94 → 2.50 against RX tuned's 2.28
+(+0.22 ± 0.10), DNSMOS OVRL 2.73 → 3.08 against 3.01 (+0.07 ± 0.05), STOI and SI-SDR level; against 0.4.0 over every
+take with defects PESQ +0.20 ± 0.06, OVRL +0.13 ± 0.04, STOI +0.01 ± 0.00, SI-SDR +0.3 ± 0.2 dB, clean takes and music
+the same. The steady beds now level with RX (+0.03 ± 0.21). RX still leads on DEMAND's (−0.37 ± 0.42): of the nine the
+plan finds five (ours ahead there, 2.43 against 2.35) and misses four, three hallways and a river read 25.5 to 34 dB
+under the voice, which RX's De-noise, on every take, takes. It takes hum as part of the bed too (PESQ +0.31 ± 0.57 over
+ours, which keeps the voice: SI-SDR 10.0 ± 4.3 dB over RX's). Clean takes: RX tuned runs its De-noise
 on every take (PESQ 4.64 → 3.81); the repairs change them by the 40 Hz guard and the deesser, deplosive and dereverb
 where their evidence holds (SDR to the input, median 12.1 dB); the guard costs music ODG 0.12.
 
@@ -157,7 +167,7 @@ true peak −1.00 dBTP; on these takes, set to −26 dB active level (speech) an
 0.04 ± 0.01, a clean mix ODG 0.30 ± 0.09 (−0.22 against the input's 0.21; the release and look-ahead tried on the
 tuning mixes, 50–400 ms and 5–10 ms, all cost as much or more), music with defects 0.16 ± 0.06; `intensity: 0`
 stops the gain at the ceiling instead (clean mixes 0.09). Against RX tuned, `auto()`: speech with defects PESQ
-+0.19 ± 0.15, music ODG +0.38 ± 0.24. A first gated build kept the music EQ past the spread of MUSDB18 mixes: a solo
++0.40 ± 0.13 (0.4.0: +0.19 ± 0.15), DNSMOS OVRL +0.00 ± 0.04 (−0.12 ± 0.05), music ODG +0.38 ± 0.24. A first gated build kept the music EQ past the spread of MUSDB18 mixes: a solo
 trumpet lay 6–7 dB past it and lost 1.9 of ODG to it; music now gets no target EQ. The tuning takes through this build
 end to end, `auto()` against its repairs: clean speech PESQ 4.52 against 4.55, with defects 2.81 against 2.86; clean
 mixes ODG −0.08 against 0.17 (input 0.21), with defects −1.52 against −1.40; speech at −16.2 LUFS (91 % within 1 LU),
@@ -165,7 +175,7 @@ music at −14.0 (95 %), the highest true peak −0.99 dBTP.
 
 What the plan turns on, per defect, recall · false alarms (takes with the defect · without it):
 
-| defect | 0.3.0 | 0.4.0 |
+| defect | 0.3.0 | 0.4.0, 0.5.0 |
 |---|---:|---:|
 | speech: steady bed → denoise (33 · 137) | 79 · 1 % | 79 · 1 % |
 | speech: DEMAND → denoise (43 · 137) | 70 · 1 % | 70 · 1 % |
@@ -180,8 +190,10 @@ What the plan turns on, per defect, recall · false alarms (takes with the defec
 | music: clicks → declick (22 · 65) | 45 · 0 % | 45 · 0 % |
 | music: clipped → declip (20 · 67) | 0 · 0 % | 100 · 0 % |
 
-The beds missed sit 25 dB or more under the voice above 63 Hz, most of a brown bed's power under it (the 40 Hz guard
-takes it); dereverb's false alarms are one reading's own room (both its clean excerpts) and beds it read as a tail. Music beds go unrepaired by design (see `denoise`
+0.5.0 puts in what 0.4.0 does; its denoise stage on speech is DeepFilterNet3's wherever the plan finds a bed (49 of the
+136 speech takes with defects; its guard heard none of them as music). The beds missed sit 25 dB or more under the
+voice above 63 Hz, most of a brown bed's power under it (the 40 Hz guard takes it), or are DEMAND's hallway and river,
+read 25.5 to 34 dB under where they lie 2.6 to 18 dB under; dereverb's false alarms are one reading's own room (both its clean excerpts) and beds it read as a tail. Music beds go unrepaired by design (see `denoise`
 above); hum under a mix stays too faint for dehum's detection. Through `audio`, 0.3's `auto()` normalized every take to
 −6 LUFS (its `targetLufs` sentinel clamped into the declared range; see Manifest), not the type's −16.
 
@@ -245,6 +257,10 @@ Two host-facing surfaces per [`@audio/compile` CONTRACT.md](https://github.com/a
 - **`chain`** — stat atom, `{ stat: 'chain', compute(channels, opts) }`. `analyze` +
   `plan` only, **no processing** — the recipe for a report/preview UI (Mix Analyser's
   feed, a "show me the chain before you render" panel) without paying for a render.
+- For a host that runs the recipe itself (audio's `auto()`, which runs the neural
+  denoise stage between `apply()`'s parts): `analyze`, `plan`, `apply`, `code`, and
+  `options(params)`, plan()'s options from the params as a host hands them over (the
+  `targetLufs` sentinel resolved).
 
 `audio.d.ts` is **hand-written, not tool-generated**: `@audio/compile/tools/dts.js` only
 walks monorepo `<family>/packages/*` layouts (`readdirSync(FAM, fam, 'packages')`) — it
@@ -252,13 +268,15 @@ has no root-package mode, and this repo is a root package with no `packages/` di
 
 ## Scope
 
-Classical DSP only. Every processing stage is a deterministic, published `@audio/*`
+Classical DSP only. Every processing stage this package runs is a deterministic, published `@audio/*`
 atom — BS.1770 loudness, minimum-statistics noise PSD (Martin 2001), Welch LTAS,
 biquad/FIR filters, feedforward compressors and a lookahead limiter. No ML, no black
 box: two runs on the same input are bit-identical, and `code()` turns any recipe into a
 plain script you can read, edit, and re-run without this package at all. That's the
 whole point — Dolby.io Media Enhance and iZotope's mastering assistants apply a chain
-exactly like this one and never show it. `@audio/chain` always does.
+exactly like this one and never show it. `@audio/chain` always does. The one exception is
+named, not run: with `neural`, the plan hands a speech bed to `@audio/neural-denoise`'s
+DeepFilterNet3, which its caller runs and the recipe (and `code()`) names.
 
 ## Tests
 

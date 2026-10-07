@@ -2,6 +2,8 @@
 // Enhance-class products: classical DSP, no ML. analyze() measures, plan() turns the
 // measurements into an adaptive, cited stage list (the "recipe" — the visible chain
 // Dolby/iZotope hide), apply() executes it, code() exports it as copy-paste runnable JS.
+// One stage may be neural, named by plan() when its caller can run it (`neural`: a speech
+// bed to DeepFilterNet3) and run by that caller; this package runs none and imports none.
 //
 // Every stage below is a shipped @audio/* atom — this package is pure orchestration: no
 // DSP kernel lives here except the one genuinely trivial one (gain multiply) that
@@ -40,6 +42,17 @@ const clamp = (x, lo, hi) => x < lo ? lo : x > hi ? hi : x
 // the readings' own mild rooms −21 to −31 dB (PESQ against them 4.64 → 4.15–4.60); deplosive took −21.4 dB or more
 // from every take with pops, and from the rest down to −65 (a voice's own low end at a word's onset).
 const REVERB_MIN = -20, POPS_MIN = -22
+
+// The neural denoiser a plan names with `neural`: @audio/neural-denoise's DeepFilterNet3 (Schröter et al., Interspeech
+// 2023), its output mixed back by the package's mixback(), the noise DFN_LIMIT dB × intensity down. This package does
+// not run it (it is asynchronous, an ONNX model): apply() refuses it, its executor runs it (audio's auto()), code()
+// awaits it. On the 40 speech tuning takes of audio's bench/rx/assistant.mjs whose plan holds denoise, repairs alone,
+// PESQ / STOI / SI-SDR / DNSMOS OVRL: OM-LSA 1.99 / 0.868 / 14.7 dB / 2.87; DeepFilterNet3 at deepfilter()'s defaults
+// (18 dB, noise near the voice to 40 dB under it) 2.51 / 0.894 / 16.5 / 3.13, at 24 and 30 dB 2.55 and 2.61, at 60
+// 2.74 / 0.896 / 16.5 / 3.20, its whole removal the same (DNSMOS SIG 3.43, OM-LSA 3.36: the voice no worse for it).
+// A steady bed alone 2.61 → 3.31, DEMAND's 1.86 → 2.84. At 60 dB down no bed reaches a floor (40 dB under the voice:
+// 50 and 60 scored as none), so none: the noise goes 60 dB down, a trace of the room left, not digital silence.
+const NEURAL = '@audio/neural-denoise', DFN_LIMIT = 60
 
 // Accept a bare mono Float32Array the same way every dependency kernel does.
 const toChannels = (channels) => channels[0]?.length === undefined ? [channels] : channels
@@ -281,11 +294,26 @@ export function plan(analysis, opts = {}) {
   // (beds 15–35 dB under the mix, and three clean mixes whose steady parts read as one) it left the take further from
   // the clean mix than it came (SI-SDR −1.8 to −10.7 dB) and PEAQ's grade no better. `intensity` scales the floor the
   // noise is taken to from the kernel's −15 dB.
-  if (speechLike && analysis.snr < BED_SNR) {
-    stages.push({
+  // With `neural` (its caller runs @audio/neural-denoise: audio's auto()), speech's bed goes to DeepFilterNet3 instead
+  // (NEURAL above); voice-music keeps omlsa, as the model takes a music bed under a voice for noise. A take the model's
+  // guard passes as music in its larger part ({ music }: the share its caller saw it pass where this stage runs) the
+  // model would leave as it came: omlsa there, as without it. The gate is the bed's evidence alone: the 15 tuning beds it
+  // misses would gain as much (PESQ 2.36 → 2.95), but neither its level nor the model's own removal tells them from
+  // other takes: clean ones read 23–66 dB under where they read 25.5–47, and on the 96 takes without a bed read under
+  // 40 dB the model cost the clean ones PESQ 0.08 (4.55 → 4.47), most others 0.3–2.3 dB of SI-SDR; what it takes where
+  // this stage runs is a room's tail first (−4 to −11 dB of the takes in a room, −5 to −24 of the missed beds), and over
+  // −18 dB it added 9 of the beds with 20 other takes, one clean: PESQ +0.18 a take, STOI −0.003, SI-SDR −0.8 dB.
+  const bed = analysis.snr < BED_SNR, music = opts.neural?.music > 0.5
+  if (speechLike && bed) {
+    const why = `noise bed ${analysis.snr.toFixed(1)} dB under the program (< ${BED_SNR} dB trigger)`
+    stages.push(opts.neural && type === 'speech' && !music ? {
+      atom: NEURAL, name: 'denoise',
+      params: { model: 'deepfilternet3', limit: Math.max(2, DFN_LIMIT * intensity), floor: 0 },
+      why,
+    } : {
       atom: '@audio/denoise-omlsa', name: 'denoise',
       params: { gMin: clamp(-15 * intensity, -30, -2) },
-      why: `noise bed ${analysis.snr.toFixed(1)} dB under the program (< ${BED_SNR} dB trigger)`,
+      why: why + (music ? `; DeepFilterNet3 hears music in ${Math.round(100 * opts.neural.music)} % of it` : ''),
     })
   }
 
@@ -436,6 +464,7 @@ function runStage(stage, out, fs) {
       for (let c = 0; c < out.length; c++) deplosive(out[c], { ...p, fs })
       break
     case 'denoise':
+      if (stage.atom === NEURAL) throw new Error(`@audio/chain: apply() can't run the denoise stage, ${NEURAL}'s ${p.model}: it runs asynchronously. Apply the stages before it, await its denoise(), apply the rest, as code() writes it (audio's auto() runs it so)`)
       for (let c = 0; c < out.length; c++) out[c] = omlsa(out[c], { fs, gMin: p.gMin })
       break
     case 'dereverb':
@@ -537,7 +566,8 @@ export default function chain(channels, opts = {}) {
 // Exports the recipe as copy-paste runnable ESM: imports of each stage's atom, then the
 // stages applied in order with the exact params the recipe carries (including embedded
 // derived data — the EQ correction curve), then apply()'s refinement pass: the script
-// renders what apply() renders, bit for bit, without re-analyzing anything.
+// renders what apply() renders, bit for bit, without re-analyzing anything. A neural
+// denoise stage is awaited (an ES module's top-level await), as its executor runs it.
 export function code(recipe) {
   const fs = recipe.fs
   const seen = new Set()
@@ -570,6 +600,11 @@ export function code(recipe) {
         bodyLines.push(`channels.forEach((ch, i) => { channels[i] = dereverb(ch, ${JSON.stringify({ ...p, fs })}) })`)
         break
       case 'denoise':
+        if (stage.atom === NEURAL) {
+          addImport(`import denoise from '${NEURAL}'`)
+          bodyLines.push(`for (let i = 0; i < channels.length; i++) channels[i] = await denoise(channels[i], ${JSON.stringify({ sampleRate: fs, ...p })})`)
+          break
+        }
         addImport(`import omlsa from '@audio/denoise-omlsa'`)
         bodyLines.push(`channels.forEach((ch, i) => { channels[i] = omlsa(ch, { fs: ${fs}, gMin: ${p.gMin} }) })`)
         break

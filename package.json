@@ -1,6 +1,6 @@
 {
   "name": "@audio/chain",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Auto-Chain — analysis-driven processing chain: measure, build an adaptive stage list, apply it, show the recipe (Dolby.io Media Enhance class, classical DSP, no ML)",
   "type": "module",
   "sideEffects": false,

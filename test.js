@@ -13,9 +13,11 @@ import { BED_SNR, CLICK_RATE } from '@audio/denoise-detect'
 import targetCurve from '@audio/spectral-target'
 const targetFor = (type, bins) => targetCurve(type, { fs: 44100, bins })
 import chain, { analyze, plan, apply, code } from './chain.js'
-import { auto, chain as chainStat } from './audio.js'
+import { auto, chain as chainStat, options } from './audio.js'
 
 const FS = 44100
+// the neural denoise stage's limit at intensity 1, dB (chain.js NEURAL)
+const NEURAL_LIMIT = 60
 
 // ─── generic synth helpers ─────────────────────────────────────────────────
 
@@ -517,11 +519,12 @@ test('code(recipe) emits every stage atom + params, in order, as syntactically v
 
 // The script itself, run: its imports resolved from this package's dependencies, its body a
 // function of `channels`. It renders what apply() renders, bit for bit (refinement pass included).
-async function runCode(recipe, channels) {
+// `stubs`: a module URL for a package this one doesn't depend on (the neural denoiser).
+async function runCode(recipe, channels, stubs = {}) {
   const lines = code(recipe).split('\n')
-  const imports = lines.filter(l => l.startsWith('import ')).map(l => l.replace(/'(@audio\/[^']+)'/, (_, s) => `'${import.meta.resolve(s)}'`))
+  const imports = lines.filter(l => l.startsWith('import ')).map(l => l.replace(/'(@audio\/[^']+)'/, (_, s) => `'${stubs[s] ?? import.meta.resolve(s)}'`))
   const body = lines.filter(l => !l.startsWith('import ')).join('\n')
-  const mod = await import('data:text/javascript,' + encodeURIComponent(`${imports.join('\n')}\nexport default channels => {\n${body}\nreturn channels\n}`))
+  const mod = await import('data:text/javascript,' + encodeURIComponent(`${imports.join('\n')}\nexport default async channels => {\n${body}\nreturn channels\n}`))
   return mod.default(channels)
 }
 
@@ -532,6 +535,54 @@ test('code(recipe) runs and renders exactly what apply() renders', async () => {
     for (let i = 0; i < want[0].length; i++) diff = Math.max(diff, Math.abs(got[0][i] - want[0][i]))
     assert.equal(diff, 0, `${recipe.type} (${recipe.stages.map(s => s.name).join(',')}): largest difference ${diff}`)
   }
+})
+
+// ─── 8b. the neural denoise stage: named by plan() for its caller to run ───
+
+// With `neural`, a speech bed goes to @audio/neural-denoise's DeepFilterNet3, which this package neither imports nor
+// runs: its caller does (audio's auto()), and code() awaits it. The stand-in below takes each channel to half.
+const half = 'data:text/javascript,' + encodeURIComponent('export default async (x, o) => ((globalThis.denoised ??= []).push(o), x.map(v => v / 2))')
+
+test('neural: a speech bed goes to DeepFilterNet3, its limit × intensity, the evidence cited as for omlsa; voice-music, music and a take it hears as music keep their own', () => {
+  for (const [intensity, limit] of [[0, 2], [0.5, NEURAL_LIMIT / 2], [1, NEURAL_LIMIT], [2, 2 * NEURAL_LIMIT]]) {
+    const st = plan(aDirty, { type: 'speech', intensity, neural: true }).stages, d = st.find(s => s.name === 'denoise')
+    assert.equal(d.atom, '@audio/neural-denoise')
+    assert.deepEqual(d.params, { model: 'deepfilternet3', limit, floor: 0 }, `intensity ${intensity}: no floor (mixback()'s 40 dB, explicitly off)`)
+    const was = plan(aDirty, { type: 'speech', intensity }).stages
+    assert.equal(d.why, was.find(s => s.name === 'denoise').why)
+    assert.deepEqual(st.map(s => s.name), was.map(s => s.name), 'the stages around it as without it')
+  }
+  assert.equal(plan(aDirty, { type: 'voice-music', neural: true }).stages.find(s => s.name === 'denoise').atom, '@audio/denoise-omlsa', 'a music bed under a voice is not noise')
+  // its caller's evidence: the share the model's guard passed as music where the stage runs
+  const heard = plan(aDirty, { type: 'speech', neural: { music: 0.9 } }).stages.find(s => s.name === 'denoise')
+  assert.equal(heard.atom, '@audio/denoise-omlsa', 'passed as music in its larger part: the model would leave it as it came')
+  assert.match(heard.why, /; DeepFilterNet3 hears music in 90 % of it$/)
+  assert.equal(plan(aDirty, { type: 'speech', neural: { music: 0.2 } }).stages.find(s => s.name === 'denoise').atom, '@audio/neural-denoise', 'speech in its larger part')
+  assert.ok(!plan(aDirty, { type: 'music', neural: true }).stages.some(s => s.name === 'denoise'), 'music: no denoise')
+  assert.ok(!plan(analyze([cleanTake], { fs: FS }), { type: 'speech', neural: true }).stages.some(s => s.name === 'denoise'), 'clean speech: none')
+})
+
+test('neural: apply() refuses the stage it can\'t run, and says how it runs', () => {
+  const recipe = plan(aDirty, { type: 'speech', neural: true })
+  assert.throws(() => apply([dirty], recipe, { fs: FS }), /can't run the denoise stage, @audio\/neural-denoise's deepfilternet3: it runs asynchronously/)
+  assert.throws(() => chain([dirty], { type: 'speech', neural: true }), /asynchronously/)
+})
+
+test('neural: code() awaits the package\'s denoise() on each channel with the stage\'s params, the stages around it as apply() runs them', async () => {
+  const recipe = plan(aDirty, { type: 'speech', neural: true }), i = recipe.stages.findIndex(s => s.name === 'denoise')
+  const src = code(recipe)
+  assert.ok(src.includes(`import denoise from '@audio/neural-denoise'`) && !src.includes('denoise-omlsa'), 'the denoiser that runs, and no other')
+  globalThis.denoised = []
+  const got = await runCode(recipe, [Float32Array.from(dirty), Float32Array.from(dirty)], { '@audio/neural-denoise': half })
+  assert.deepEqual(globalThis.denoised, [0, 1].map(() => ({ sampleRate: FS, ...recipe.stages[i].params })), 'each channel, the stage\'s params')
+  const part = (a, b) => ({ ...recipe, stages: recipe.stages.slice(a, b) })
+  const want = apply(apply([dirty, dirty], part(0, i), { fs: FS }).map(x => x.map(v => v / 2)), part(i + 1), { fs: FS })
+  for (let c = 0; c < 2; c++) {
+    let diff = got[c].length === want[c].length ? 0 : Infinity
+    for (let k = 0; k < want[c].length; k++) diff = Math.max(diff, Math.abs(got[c][k] - want[c][k]))
+    assert.equal(diff, 0, `channel ${c}: largest difference ${diff}`)
+  }
+  delete globalThis.denoised
 })
 
 test('edge cases: empty, one sample, shorter than every window, silence — no throw, no NaN, length kept', () => {
@@ -550,6 +601,12 @@ test('edge cases: empty, one sample, shorter than every window, silence — no t
 test('manifest: the targetLufs sentinel survives a host clamping the default into its range', () => {
   const p = auto.params.targetLufs
   assert.equal(Math.min(p.max, Math.max(p.min, p.default)), 0)
+})
+
+test('manifest: options() turns the params a host hands over into plan()\'s, the sentinel no override', () => {
+  assert.deepEqual(options({ type: 'music', intensity: new Float32Array([0.5]), targetLufs: new Float32Array([0]), ceiling: new Float32Array([-2]) }),
+    { type: 'music', intensity: 0.5, targetLufs: undefined, ceiling: -2 })
+  assert.deepEqual(options({ type: 'speech', intensity: 1, targetLufs: -20, ceiling: -1 }), { type: 'speech', intensity: 1, targetLufs: -20, ceiling: -1 })
 })
 
 test('manifest: auto processes a buffer without NaN, chain stat returns a recipe', () => {
