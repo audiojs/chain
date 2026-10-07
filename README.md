@@ -86,9 +86,9 @@ just executing the recipe literally.
 
 `node bench/rx/assistant.mjs test` in [audio](https://github.com/audiojs/audio) (2026-10): takes with several defects at
 once, each made on a clean recording, so a repair is scored against the sound before the damage. Speech: VoiceBank's
-test speakers, four utterances to a take (52 takes), and 20 s of eight Spoken Wikipedia readings, twice (16); music: 25
-MUSDB18 test previews and four longer pieces. Each clip makes three takes: clean; one defect, the kinds in turn; two to
-four at random. The defects (seeded; every setting in the script's header): a steady bed (white, pink, brown, or under
+test speakers, four utterances to a clip (52 clips), and 20 s of eight Spoken Wikipedia readings, twice (16); music: 25
+MUSDB18 test previews and four longer pieces (29). Each clip makes three takes: clean; one defect, the kinds in turn; two
+to four at random. The defects (seeded; every setting in the script's header): a steady bed (white, pink, brown, or under
 150 Hz) 5–25 dB under the voice; a DEMAND recording 0–20 dB under; mains hum or buzz 20–35 dB under; clicks 1–4 a
 second at 3–10× the sound around them; hard clipping to 3–15 dB SDR, the rails at full scale; a MIT IR Survey room (the
 reference: the take's early sound in it); sibilants 4–12 dB brighter; plosive pops. Music gets the first five, gentler.
