@@ -257,20 +257,26 @@ const finished = (type, { lufs = -20, truePeakDb = -4, lra = 5 } = {}) => {
   return { fs: FS, duration: 10, channels: 1, lufs, truePeakDb, lra, snr: Infinity, ltas, sibilanceDb: -20, hum: null,
     clipping: { count: 0, ratio: 0, level: null, kind: null }, clicks: 0, voicedRatio: 0.5, reverb: null, pops: null }
 }
-test('mastering stages act on measured need: a finished take gets the gain alone, short of the target where its peaks say', () => {
+test('mastering stages act on measured need: a finished take gets the gain alone, and limiting only where the target needs it', () => {
   for (const type of ['music', 'speech']) {
-    const st = plan(finished(type), { type }).stages.map(s => s.name)
-    assert.deepEqual(st, ['hpf', 'gain'], `${type}: ${st}`)
+    // loud and controlled: turned down, nothing else; quiet with peaks to spare: raised, nothing else
+    for (const [lufs, truePeakDb] of [[-10, -1], [-30, -20]]) {
+      const st = plan(finished(type, { lufs, truePeakDb }), { type }).stages.map(s => s.name)
+      assert.deepEqual(st, ['hpf', 'gain'], `${type} ${lufs} LUFS, ${truePeakDb} dBTP: ${st}`)
+    }
   }
-  const g = plan(finished('music'), { type: 'music' }).stages.find(s => s.name === 'gain')
-  assert.deepEqual(g.params, { target: -14, ceiling: -1, limit: 0 })
-  assert.match(g.why, /\+3\.0 dB/, 'raised until its true peak (-4) meets the ceiling (-1), not the 6 dB to -14 LUFS')
-  // wider dynamics put the glue in, by how far over; intensity 2 allows 6 dB of limiting, and the limiter with it
+  // a mix 6 dB under -14 LUFS whose peaks allow 3: the limiter takes the rest, 6 dB at most × intensity
+  const st = plan(finished('music'), { type: 'music' }).stages, g = st.find(s => s.name === 'gain')
+  assert.deepEqual(st.map(s => s.name), ['hpf', 'gain', 'limiter'])
+  assert.deepEqual(g.params, { target: -14, ceiling: -1, limit: 6 })
+  assert.equal(st.find(s => s.name === 'limiter').params.truePeak, true)
+  const off = plan(finished('music'), { type: 'music', intensity: 0 }).stages
+  assert.deepEqual(off.map(s => s.name), ['hpf', 'gain'], 'intensity 0: no limiting, the gain stops at the ceiling')
+  assert.match(off.find(s => s.name === 'gain').why, /\+3\.0 dB/)
+  assert.equal(plan(finished('music'), { type: 'music', intensity: 2 }).stages.find(s => s.name === 'gain').params.limit, 12)
+  // wider dynamics put the glue in, by how far over
   const wide = plan(finished('music', { lra: 18 }), { type: 'music' }).stages.find(s => s.name === 'multiband')
   assert.equal(wide?.params.ratio, 1.5)
-  const loud = plan(finished('music'), { type: 'music', intensity: 2 }).stages
-  assert.equal(loud.find(s => s.name === 'gain').params.limit, 6)
-  assert.ok(loud.some(s => s.name === 'limiter'))
   // a voice off the target by more than clean voices are gets the excess back, only that
   const dull = finished('speech'), n = 2 * (dull.ltas.length - 1)
   for (let k = 0; k < dull.ltas.length; k++) if (k * FS / n > 3000) dull.ltas[k] *= 10 ** (-20 / 20)
@@ -279,6 +285,18 @@ test('mastering stages act on measured need: a finished take gets the gain alone
   const at = f => eq.params.correction[Math.round(f * n / FS)]
   assert.ok(at(5000) > 1 && at(5000) < 20 - 6.9, `5 kHz: ${at(5000).toFixed(1)} dB, the excess over the spread`)
   assert.ok(Math.abs(at(500)) < 1, `500 Hz untouched: ${at(500).toFixed(1)} dB`)
+})
+
+// The loudness auto() promises: a quiet clean voice, 14 dB under the target, every 4th syllable 4 dB up (peak to
+// loudness 15.7 dB, over the 15 the target and the ceiling leave), reaches it within 1 LU, its true peak under the
+// -1 dBTP ceiling (the limiter reads the waveform between samples, BS.1770-4 Annex 2). Measured −16.1 LUFS, −1.00 dBTP;
+// the gated build that stopped at the ceiling left it at −17.8.
+test('a quiet clean take reaches the loudness target within 1 LU, its true peak under the ceiling', () => {
+  const peaky = cleanTake.map((v, i) => Math.floor(i / FS / 0.5) % 4 === 1 ? v * 10 ** (4 / 20) : v)
+  const lu = analyze([peaky], { fs: FS }).lufs, quiet = peaky.map(v => v * 10 ** ((-30 - lu) / 20))
+  const { channels, recipe } = chain([quiet], { type: 'speech' }), a = analyze(channels, { fs: FS })
+  assert.ok(Math.abs(a.lufs + 16) <= 1, `${a.lufs.toFixed(2)} LUFS (${recipe.stages.map(s => s.name)})`)
+  assert.ok(a.truePeakDb <= -1 + 0.05, `true peak ${a.truePeakDb.toFixed(2)} dBTP`)
 })
 
 // ─── 4b. plan(speech) — each defect on its evidence alone ──────────────────

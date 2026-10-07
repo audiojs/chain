@@ -375,30 +375,34 @@ export function plan(analysis, opts = {}) {
     })
   }
 
-  // 11. gain: toward the loudness target as far as the true peak allows under the ceiling, measured where the stage
-  // runs (after the repairs and the EQ, which move both): a quiet take is raised until its peaks reach the ceiling, as
-  // streaming normalization raises a quiet master (Spotify's, at its normal setting), and limited only by `limit` dB
-  // more: 6 dB × (intensity − 1), none at 1. On the clean tuning takes any limiting cost: PESQ 4.64 → 4.62 at 1 dB (one
-  // reading 3.91), 4.60 at all the target needs (2.6 dB median); music ODG 0.21 → 0.16, −0.03. A loud take is turned
-  // down. Reference mode reaches the reference's loudness, its limiter taking what it must, as before.
+  // 11. gain: toward the loudness target, measured where the stage runs (after the repairs and the EQ, which move
+  // both), its true peak held under the ceiling with at most `limit` dB of limiting: 6 dB × intensity (none at 0). The
+  // clean tuning takes needed 2.6 dB of limiting to reach their targets (median; 95th percentile speech 6.9, music
+  // 5.3), and it cost little next to the EQ and glue 0.3 put on every take: PESQ 4.64 → 4.60 at 6 dB (4.60 at all they
+  // needed), music ODG 0.21 → −0.03 with the true-peak limiter. A take that needs more stops short of the target by the
+  // rest; a loud one is turned down. Reference mode reaches the reference's loudness, its limiter taking what it must.
   let ceiling = opts.ceiling ?? -1
   if (reference && reference.truePeakDb != null) ceiling = Math.min(ceiling, reference.truePeakDb)
-  const limit = reference ? Infinity : 6 * Math.max(0, intensity - 1)
   const measured = analysis.lufs ?? targetLufs, peak = analysis.truePeakDb ?? -Infinity
+  const cap = reference ? Infinity : 6 * intensity
+  // the limiter where the gain may take peaks over the ceiling: predicted from the take as it came, and wherever declip
+  // rebuilds peaks over its rails or the EQ lifts a band; without it the gain stops at the ceiling
+  const lifts = stages.some(s => s.name === 'declip' || s.name === 'eq')
+  const limit = cap > 0 && (lifts || clamp(targetLufs - measured, -20, 20) > ceiling - peak) ? cap : 0
   const gainDb = clamp(Math.min(targetLufs - measured, ceiling - peak + limit), -20, 20)
   stages.push({
     atom: 'gain', name: 'gain',
     params: { target: targetLufs, ceiling, limit: limit === Infinity ? 99 : limit },
-    why: `loudness toward ${targetLufs} LUFS as far as the true peak allows under ${ceiling.toFixed(1)} dBTP${limit ? ` (and ${limit === Infinity ? 'all the' : limit.toFixed(1) + ' dB of'} limiting)` : ''}: measured ${measured.toFixed(1)} LUFS, ${peak.toFixed(1)} dBTP -> about ${gainDb >= 0 ? '+' : ''}${gainDb.toFixed(1)} dB`,
+    why: `loudness ${measured.toFixed(1)} -> ${targetLufs} LUFS, true peak ${peak.toFixed(1)} dBTP under ${ceiling.toFixed(1)}${limit ? `, with ${limit === Infinity ? 'all the' : `at most ${limit.toFixed(1)} dB of`} limiting` : ''}: about ${gainDb >= 0 ? '+' : ''}${gainDb.toFixed(1)} dB`,
   })
 
-  // 12. limiter: only where the gain may take peaks over the ceiling (limit > 0: intensity over 1, or reference mode);
-  // sample peaks: dynamics-limiter does not constrain inter-sample peaks, which pass it by a fraction of a dB.
+  // 12. limiter: where the gain may take peaks over the ceiling; true peak (ITU-R BS.1770-4 Annex 2: the waveform
+  // between samples held under the ceiling too). Idle under the ceiling: the sound passes as it came.
   if (limit > 0) {
     stages.push({
       atom: '@audio/dynamics-limiter', name: 'limiter',
-      params: { ceiling, lookahead: 5, release: 50 },
-      why: `peak ceiling ${ceiling.toFixed(1)} dB${reference ? ' (matched to reference true peak)' : `, at most ${limit.toFixed(1)} dB taken (intensity ${intensity})`}`,
+      params: { ceiling, lookahead: 5, release: 50, truePeak: true },
+      why: `true peak ceiling ${ceiling.toFixed(1)} dBTP${reference ? ' (matched to reference true peak)' : `, at most ${limit.toFixed(1)} dB taken (6 dB × intensity ${intensity})`}`,
     })
   }
 
@@ -474,7 +478,7 @@ function runStage(stage, out, fs) {
       break
     }
     case 'limiter':
-      for (let c = 0; c < out.length; c++) out[c] = limiter(out[c], { sampleRate: fs, ceiling: p.ceiling, lookahead: p.lookahead, release: p.release })
+      for (let c = 0; c < out.length; c++) out[c] = limiter(out[c], { sampleRate: fs, ceiling: p.ceiling, lookahead: p.lookahead, release: p.release, truePeak: p.truePeak })
       break
     default:
       throw new Error(`@audio/chain: apply() — unknown stage "${stage.name}"`)
@@ -485,16 +489,21 @@ export function apply(channels, recipe, { fs = 44100 } = {}) {
   channels = toChannels(channels)
   const out = channels.map(ch => Float32Array.from(ch))
 
-  for (const stage of recipe.stages) runStage(stage, out, fs)
+  // the loudness the gain stage gave (the target, or short of it where its limit stopped it)
+  let aimed = recipe.targetLufs
+  for (const stage of recipe.stages) {
+    runStage(stage, out, fs)
+    if (stage.name === 'gain') { const m = lufsFn(out, { fs }); if (Number.isFinite(m)) aimed = Math.min(recipe.targetLufs, m) }
+  }
 
-  // Single refinement pass: re-measure once after gain+limiter, trim <= +-2 dB if the
-  // integrated loudness missed target, then re-limit (a trim can otherwise punch a new
-  // true-peak overshoot through the ceiling the limiter stage just enforced above).
+  // Single refinement pass: re-measure once after the limiter, trim <= +-2 dB back to the
+  // loudness the gain gave (what the limiter's peaks took from it), then re-limit (a trim
+  // can otherwise punch a new true-peak overshoot through the ceiling the limiter just enforced).
   const limiterStage = recipe.stages.find(s => s.name === 'limiter')
   if (limiterStage) {
     const measured = lufsFn(out, { fs })
     if (measured != null && isFinite(measured)) {
-      const trim = clamp(recipe.targetLufs - measured, -2, 2)
+      const trim = clamp(aimed - measured, -2, 2)
       if (Math.abs(trim) > 0.01) {
         const g = 10 ** (trim / 20)
         for (const ch of out) for (let i = 0; i < ch.length; i++) ch[i] *= g
@@ -504,6 +513,7 @@ export function apply(channels, recipe, { fs = 44100 } = {}) {
             ceiling: limiterStage.params.ceiling,
             lookahead: limiterStage.params.lookahead,
             release: limiterStage.params.release,
+            truePeak: limiterStage.params.truePeak,
           })
       }
     }
@@ -597,18 +607,19 @@ export function code(recipe) {
       case 'gain':
         addImport(`import lufs from '@audio/loudness-lufs'`)
         addImport(`import truepeak from '@audio/loudness-truepeak'`)
-        bodyLines.push(p.db != null ? `{ const g = 10 ** (${p.db} / 20); for (const ch of channels) for (let i = 0; i < ch.length; i++) ch[i] *= g }` : [
+        bodyLines.push(p.db != null ? `{ const g = 10 ** (${p.db} / 20); for (const ch of channels) for (let i = 0; i < ch.length; i++) ch[i] *= g }\nconst aimed = Math.min(${recipe.targetLufs}, lufs(channels, { fs }))` : [
           `{`,
           `  const m = lufs(channels, { fs }), tp = truepeak(channels, { fs })`,
           `  const db = Number.isFinite(m) ? Math.max(-20, Math.min(20, Math.min(${p.target} - m, ${p.ceiling} - (Number.isFinite(tp) ? tp : -Infinity) + ${p.limit}))) : 0`,
           `  const g = 10 ** (db / 20)`,
           `  for (const ch of channels) for (let i = 0; i < ch.length; i++) ch[i] *= g`,
           `}`,
+          `const aimed = Math.min(${recipe.targetLufs}, lufs(channels, { fs }))`,
         ].join('\n'))
         break
       case 'limiter':
         addImport(`import limiter from '@audio/dynamics-limiter'`)
-        bodyLines.push(`channels.forEach((ch, i) => { channels[i] = limiter(ch, ${JSON.stringify({ sampleRate: fs, ceiling: p.ceiling, lookahead: p.lookahead, release: p.release })}) })`)
+        bodyLines.push(`channels.forEach((ch, i) => { channels[i] = limiter(ch, ${JSON.stringify({ sampleRate: fs, ceiling: p.ceiling, lookahead: p.lookahead, release: p.release, truePeak: p.truePeak })}) })`)
         break
     }
     bodyLines.push('')
@@ -618,14 +629,14 @@ export function code(recipe) {
   const lim = recipe.stages.find(s => s.name === 'limiter')
   if (lim) {
     addImport(`import lufs from '@audio/loudness-lufs'`)
-    bodyLines.push(`// trim — loudness re-measured, trimmed <= ±2 dB to ${recipe.targetLufs} LUFS, re-limited (apply()'s refinement pass)`)
+    bodyLines.push(`// trim: loudness re-measured, trimmed <= ±2 dB back to what the gain gave, re-limited (apply()'s refinement pass)`)
     bodyLines.push([
       `{`,
-      `  const m = lufs(channels, { fs }), trim = Math.max(-2, Math.min(2, ${recipe.targetLufs} - m))`,
+      `  const m = lufs(channels, { fs }), trim = Math.max(-2, Math.min(2, (Number.isFinite(aimed) ? aimed : ${recipe.targetLufs}) - m))`,
       `  if (Number.isFinite(m) && Math.abs(trim) > 0.01) {`,
       `    const g = 10 ** (trim / 20)`,
       `    for (const ch of channels) for (let i = 0; i < ch.length; i++) ch[i] *= g`,
-      `    channels.forEach((ch, i) => { channels[i] = limiter(ch, ${JSON.stringify({ sampleRate: fs, ceiling: lim.params.ceiling, lookahead: lim.params.lookahead, release: lim.params.release })}) })`,
+      `    channels.forEach((ch, i) => { channels[i] = limiter(ch, ${JSON.stringify({ sampleRate: fs, ceiling: lim.params.ceiling, lookahead: lim.params.lookahead, release: lim.params.release, truePeak: lim.params.truePeak })}) })`,
       `  }`,
       `}`,
     ].join('\n'))

@@ -39,7 +39,7 @@ for (const s of recipe.stages) console.log(`${s.name.padEnd(9)} ${s.why}`)
 | opt | default | meaning |
 |---|---|---|
 | `type` | `'speech'` | `'speech' \| 'music' \| 'voice-music'` |
-| `intensity` | `1` | `0..2`: scales how hard the adaptive stages work: denoise's a priori SNR floor (−15 dB × intensity, −2..−30), dereverb's late estimate (`strength` × intensity), the deesser's deepest cut (−8 dB × intensity), the EQ's correction past the spread, the multiband ratio, the limiting allowed to reach the loudness target (6 dB × (intensity − 1)). Does not change *whether* a stage fires (that's measurement-only, see below); declip, declick, deplosive and dehum have no strength |
+| `intensity` | `1` | `0..2`: scales how hard the adaptive stages work: denoise's a priori SNR floor (−15 dB × intensity, −2..−30), dereverb's late estimate (`strength` × intensity), the deesser's deepest cut (−8 dB × intensity), the EQ's correction past the spread, the multiband ratio, the limiting allowed to reach the loudness target (6 dB × intensity). Does not change *whether* a stage fires (that's measurement-only, see below); declip, declick, deplosive and dehum have no strength |
 | `targetLufs` | per-type | override the loudness target (speech/voice-music `-16`, music `-14` — EBU-informed conventions) |
 | `reference` | — | `{ ltas, lufs, truePeakDb, width }`, typically `analyze()` of a reference track — see **Reference mode** |
 | `ceiling` | `-1` | peak ceiling override, dB |
@@ -68,14 +68,14 @@ reads as a room to one, a kick drum as a pop to the other).
 | `eq` | `@audio/eq-fir` | speech or reference mode, `max\|correction\| >= 1 dB` (post-intensity) | spectral-target's `deviation()`, Byrne's LTASS less the LTAS over 100 Hz–10 kHz, levelled per octave, octave-smoothed: only what lies past the spread clean voices keep about it (the largest deviation, per octave, of the tuning split's 61 clean speech takes: 6.9–12 dB), × intensity. Not on music: Pestana's slope is the average of commercial pop mixes, not of music (a solo trumpet lies 6–7 dB past their spread). A reference (reference mode) is matched whole |
 | `multiband` | `@audio/dynamics-multiband` | `lra > 12` | the loudness range (EBU Tech 3342) wider than finished programme keeps it (no clean tuning take came within 7 LU of 12); ratio 1 + intensity × (LRA − 12)/12, to 2; threshold at the take's integrated loudness; 2-band split for speech, 3-band where music is; downward only |
 | `width` | `@audio/spatial-midside` | reference mode, both ≥2ch | `analysis.width` vs `reference.width` (side/mid RMS ratio) — reference mode only, see below |
-| `gain` | *(inline)* | always | toward `targetLufs` as far as the true peak allows under the ceiling, measured on the sound reaching it (after the repairs and the EQ): `min(target − LUFS, ceiling − true peak + limit)`, ±20 dB; `limit` 6 dB × (intensity − 1), none at 1. A quiet take is raised until its peaks meet the ceiling, as streaming normalization raises a quiet master; a loud one is turned down |
-| `limiter` | `@audio/dynamics-limiter` | `limit > 0` (intensity over 1) or reference mode | peak ceiling, default `-1` dB (tightened to `min(ceiling, reference.truePeakDb)` in reference mode), taking at most `limit` dB. On the clean tuning takes any limiting cost (PESQ 4.64 → 4.62 at 1 dB, 4.60 at all −16 LUFS needs; music ODG 0.21 → −0.03). The limiter holds sample peaks: an inter-sample peak can pass it by a fraction of a dB |
+| `gain` | *(inline)* | always | toward `targetLufs`, measured on the sound reaching it (after the repairs and the EQ): `min(target − LUFS, ceiling − true peak + limit)`, ±20 dB; `limit` 6 dB × intensity where the take's peaks, declip's rebuilt ones or the EQ's lift may go over the ceiling, else 0. A loud take is turned down; one needing more than `limit` stops short by the rest |
+| `limiter` | `@audio/dynamics-limiter` | `limit > 0` or reference mode | true-peak ceiling, default `-1` dBTP (BS.1770-4 Annex 2: the waveform between samples held under it; tightened to `min(ceiling, reference.truePeakDb)` in reference mode), taking at most `limit` dB; idle under the ceiling. The clean tuning takes needed 2.6 dB of it to reach their targets (median; 95th percentile speech 6.9, music 5.3), at PESQ 4.64 → 4.60 and music ODG 0.21 → −0.03 for up to 6 dB |
 
 Corrective stages fire on the **input's own** analysis in either mode: reference mode changes the tone/loudness/width
 target, not whether the input's own defects get fixed.
 
-`apply()`'s refinement pass, where a `limiter` stage runs: after every stage, loudness is re-measured once; if it's off by more than the limiter/gain's own
-tolerance, a ±2 dB trim is applied and the limiter re-run (a trim can otherwise punch a
+`apply()`'s refinement pass, where a `limiter` stage runs: after every stage, loudness is re-measured once; if the limiter
+took it off what the gain gave, a ±2 dB trim back is applied and the limiter re-run (a trim can otherwise punch a
 new peak through the ceiling `limiter` already enforced). One pass, not a
 loop — documented here because it's the one place `apply()` re-measures rather than
 just executing the recipe literally.
@@ -109,35 +109,35 @@ Speech: PESQ (P.862.2), mean over the takes:
 
 | takes | input | RX tuned | RX oracle | 0.3.0 repairs | 0.3.0 `auto()` | **0.4.0 repairs** | **0.4.0 `auto()`** |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| clean (68) | 4.64 | 3.81 | 4.64 | 4.54 | 4.29 | 4.46 | 4.46 |
-| steady bed (9) | 1.81 | 2.94 | 2.95 | 2.39 | 2.15 | 2.39 | 2.39 |
-| DEMAND (9) | 1.84 | 2.90 | 2.93 | 2.03 | 1.83 | 2.07 | 2.07 |
-| hum, buzz (9) | 2.78 | 3.60 | 2.78 | 3.24 | 2.69 | 3.28 | 3.23 |
-| clicks (9) | 2.25 | 2.98 | 2.97 | 3.54 | 3.60 | 3.86 | 3.86 |
-| clipped (8) | 2.38 | 2.66 | 3.07 | 2.36 | 1.95 | 3.87 | 3.87 |
-| room (8) | 2.06 | 2.09 | 2.41 | 2.06 | 2.01 | 2.60 | 2.56 |
-| sibilance (8) | 4.44 | 3.74 | 4.58 | 4.52 | 4.35 | 4.52 | 4.52 |
-| pops (8) | 2.52 | 2.50 | 2.52 | 3.01 | 2.39 | 3.77 | 3.77 |
-| 2–4 defects (68) | 1.60 | 2.18 | 2.20 | 1.87 | 1.66 | 2.31 | 2.30 |
-| all with defects (136) | 2.04 | 2.56 | 2.61 | 2.38 | 2.14 | 2.79 | 2.78 |
+| clean (68) | 4.64 | 3.81 | 4.64 | 4.54 | 4.29 | 4.46 | 4.45 |
+| steady bed (9) | 1.81 | 2.94 | 2.95 | 2.39 | 2.15 | 2.39 | 2.38 |
+| DEMAND (9) | 1.84 | 2.90 | 2.93 | 2.03 | 1.83 | 2.07 | 2.04 |
+| hum, buzz (9) | 2.78 | 3.60 | 2.78 | 3.24 | 2.69 | 3.28 | 3.22 |
+| clicks (9) | 2.25 | 2.98 | 2.97 | 3.54 | 3.60 | 3.86 | 3.87 |
+| clipped (8) | 2.38 | 2.66 | 3.07 | 2.36 | 1.95 | 3.87 | 3.88 |
+| room (8) | 2.06 | 2.09 | 2.41 | 2.06 | 2.01 | 2.60 | 2.50 |
+| sibilance (8) | 4.44 | 3.74 | 4.58 | 4.52 | 4.35 | 4.52 | 4.49 |
+| pops (8) | 2.52 | 2.50 | 2.52 | 3.01 | 2.39 | 3.77 | 3.75 |
+| 2–4 defects (68) | 1.60 | 2.18 | 2.20 | 1.87 | 1.66 | 2.31 | 2.26 |
+| all with defects (136) | 2.04 | 2.56 | 2.61 | 2.38 | 2.14 | 2.79 | 2.75 |
 | … STOI | 0.90 | 0.91 | 0.92 | 0.91 | 0.91 | 0.93 | 0.93 |
-| … SI-SDR, dB | 9.3 | 13.0 | 13.7 | 14.7 | 12.1 | 18.2 | 18.1 |
+| … SI-SDR, dB | 9.3 | 13.0 | 13.7 | 14.7 | 12.1 | 18.2 | 14.9 |
 | … DNSMOS OVRL | 2.77 | 3.12 | 3.07 | 2.91 | 2.85 | 3.00 | 3.00 |
 
 Music: PEAQ Basic ODG (ITU-R BS.1387), mean:
 
 | takes | input | RX tuned | RX oracle | 0.3.0 repairs | 0.3.0 `auto()` | **0.4.0 repairs** | **0.4.0 `auto()`** |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| clean (29) | 0.21 | 0.21 | 0.21 | −0.28 | −2.18 | 0.09 | 0.09 |
-| steady bed (6) | −0.65 | −0.65 | −0.74 | −0.83 | −2.11 | −0.63 | −0.63 |
-| DEMAND (6) | −0.55 | −0.55 | −0.68 | −0.54 | −2.15 | −0.53 | −0.53 |
-| hum, buzz (6) | −0.67 | −0.67 | −0.67 | −0.96 | −2.51 | −0.66 | −0.66 |
-| clicks (6) | −2.38 | −2.35 | −2.38 | −1.03 | −2.38 | −0.28 | −0.28 |
+| clean (29) | 0.21 | 0.21 | 0.21 | −0.28 | −2.18 | 0.09 | −0.22 |
+| steady bed (6) | −0.65 | −0.65 | −0.74 | −0.83 | −2.11 | −0.63 | −0.84 |
+| DEMAND (6) | −0.55 | −0.55 | −0.68 | −0.54 | −2.15 | −0.53 | −0.83 |
+| hum, buzz (6) | −0.67 | −0.67 | −0.67 | −0.96 | −2.51 | −0.66 | −0.95 |
+| clicks (6) | −2.38 | −2.35 | −2.38 | −1.03 | −2.38 | −0.28 | −0.59 |
 | clipped (5) | −3.22 | −3.12 | −3.12 | −3.20 | −3.70 | −2.26 | −2.26 |
-| 2–4 defects (29) | −3.07 | −3.05 | −3.06 | −2.88 | −3.23 | −2.56 | −2.56 |
-| all with defects (58) | −2.25 | −2.23 | −2.26 | −2.06 | −2.88 | −1.69 | −1.69 |
-| … SI-SDR, dB | 16.0 | 15.0 | 14.0 | 18.3 | −14.9 | 22.3 | 22.3 |
-| … NMR, dB | −7.2 | −7.9 | −7.2 | −7.9 | 0.7 | −9.8 | −9.8 |
+| 2–4 defects (29) | −3.07 | −3.05 | −3.06 | −2.88 | −3.23 | −2.56 | −2.66 |
+| all with defects (58) | −2.25 | −2.23 | −2.26 | −2.06 | −2.88 | −1.69 | −1.85 |
+| … SI-SDR, dB | 16.0 | 15.0 | 14.0 | 18.3 | −14.9 | 22.3 | 17.8 |
+| … NMR, dB | −7.2 | −7.9 | −7.2 | −7.9 | 0.7 | −9.8 | −9.2 |
 
 Paired over the takes with defects, the repairs against RX tuned: speech PESQ +0.23 ± 0.14 (95 %), STOI +0.01 ± 0.01,
 SI-SDR +5.2 ± 1.1 dB, DNSMOS OVRL −0.12 ± 0.05; music ODG +0.54 ± 0.25, SI-SDR +7.3 ± 1.8 dB, NMR 1.9 ± 2.5 dB lower.
@@ -149,15 +149,19 @@ De-noise at 80 % takes more of a bed than OM-LSA's −15 dB floor (on the tuning
 on every take (PESQ 4.64 → 3.81); the repairs change them by the 40 Hz guard and the deesser, deplosive and dereverb
 where their evidence holds (SDR to the input, median 12.1 dB); the guard costs music ODG 0.12.
 
-`auto()`'s tone and level stages act on measured need (the rules above), so a clean take comes back as the repairs
-leave it but for its level: clean speech PESQ 4.46 (0.3.0: 4.29), clean music ODG 0.09 (−2.18); against the repairs
-alone, speech with defects −0.01 ± 0.00 (the EQ past the voice spread on a few), music ±0.00. Its gain stops where the
-true peak meets the ceiling: on these takes, set to −26 dB active level (speech) and −20 dBFS RMS (music), it leaves
-speech at −18.1 LUFS (median; 28 % within 1 LU of −16) and music at −16.9 (3 % within 1 LU of −14); `intensity: 2`
-allows 6 dB of limiting to reach them. 0.3.0's EQ toward the type's target (spectral-target's deviation(), levelled by
-bin before 1.1), its glue on every mix and its limiter on every take cost a clean mix 1.9 of ODG and a clean voice 0.25
-of PESQ against its repairs alone. A first gated build kept the music EQ past the spread of MUSDB18 mixes: a solo trumpet lay 6–7 dB past it and
-lost 1.9 of ODG to it; music now gets no target EQ.
+`auto()`'s tone and level stages act on measured need (the rules above): the EQ, the glue and 0.3's limiter on every
+take cost a clean mix 1.9 of ODG and a clean voice 0.25 of PESQ against its repairs alone. Its loudness is delivered:
+speech at −16.1 LUFS (median; 89 % of takes within 1 LU of −16), music at −14.0 (98 % within 1 LU of −14), the highest
+true peak −1.00 dBTP; on these takes, set to −26 dB active level (speech) and −20 dBFS RMS (music), that takes up to
+6 dB of limiting. Against the repairs alone that limiting costs a clean voice PESQ 0.00 ± 0.01, speech with defects
+0.04 ± 0.01, a clean mix ODG 0.30 ± 0.09 (−0.22 against the input's 0.21; the release and look-ahead tried on the
+tuning mixes, 50–400 ms and 5–10 ms, all cost as much or more), music with defects 0.16 ± 0.06; `intensity: 0`
+stops the gain at the ceiling instead (clean mixes 0.09). Against RX tuned, `auto()`: speech with defects PESQ
++0.19 ± 0.15, music ODG +0.38 ± 0.24. A first gated build kept the music EQ past the spread of MUSDB18 mixes: a solo
+trumpet lay 6–7 dB past it and lost 1.9 of ODG to it; music now gets no target EQ. The tuning takes through this build
+end to end, `auto()` against its repairs: clean speech PESQ 4.52 against 4.55, with defects 2.81 against 2.86; clean
+mixes ODG −0.08 against 0.17 (input 0.21), with defects −1.52 against −1.40; speech at −16.2 LUFS (91 % within 1 LU),
+music at −14.0 (95 %), the highest true peak −0.99 dBTP.
 
 What the plan turns on, per defect, recall · false alarms (takes with the defect · without it):
 
