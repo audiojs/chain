@@ -13,7 +13,7 @@ import lraFn from '@audio/loudness-lra'
 import { vad } from '@audio/vad'
 import { classify, CLICK_RATE, BED_SNR } from '@audio/denoise-detect'
 import ltasFn from '@audio/spectral-ltas'
-import targetCurve, { smooth } from '@audio/spectral-target'
+import targetCurve, { deviation } from '@audio/spectral-target'
 import dehum from '@audio/denoise-dehum'
 import omlsa from '@audio/denoise-omlsa'
 import declick from '@audio/denoise-declick'
@@ -103,28 +103,19 @@ function bandMean(curve, fs, frameSize, lo, hi) {
   return n ? sum / n : 0
 }
 
-// The tone correction toward a target (dB per bin): target − measured, each levelled by its mean over [lo, hi] in log
-// frequency (every octave weighs alike), smoothed an octave (spectral-target's smooth), clamped ±12 dB, faded to 0 over
-// the half octave outside [lo, hi], where the target is not known. spectral-target's deviation() levels each curve by
-// the mean of its bins over 20 Hz–0.45·fs, half of which lie in the octave over 10 kHz: clean VoiceBank speech against
-// Byrne et al.'s LTASS (held flat past its last anchor, 10 kHz) read 12 dB over the target in every band under 4 kHz and
-// was given +8.5 dB at 16 kHz (the EQ alone took clean takes' PESQ 4.64 → 4.27).
-const TONE_BAND = { speech: [100, 10000], music: [100, 4000], 'voice-music': [100, 10000] }   // the targets' anchors
-function tone(ltas, targetDb, fs, lo, hi) {
-  const bins = ltas.length, n = 2 * (bins - 1), raw = new Float32Array(bins), out = new Float32Array(bins)
-  const level = d => {
-    let s = 0, w = 0
-    for (let k = Math.max(1, Math.ceil(lo * n / fs)); k <= Math.min(bins - 1, Math.floor(hi * n / fs)); k++) s += d[k] / k, w += 1 / k
-    return w ? s / w : 0
+// The spread of clean voices about Byrne et al.'s LTASS: the largest octave-smoothed deviation from it (dB, at each
+// octave's centre) over the 61 clean speech takes of audio's bench/rx/assistant.mjs tuning split (VoiceBank's training
+// speakers, readings). The LTASS is an average over talkers: a voice within this far of it is one of them, not a tonal
+// defect, and the EQ corrects only the excess.
+const SPREAD = [[125, 10.0], [250, 8.4], [500, 8.7], [1000, 7.4], [2000, 6.9], [4000, 12.0], [8000, 8.6]]
+// the spread at f Hz: log-frequency interpolation between octave centres, held past the ends
+function spreadAt(table, f) {
+  if (f <= table[0][0]) return table[0][1]
+  for (let i = 1; i < table.length; i++) if (f <= table[i][0]) {
+    const [f0, v0] = table[i - 1], [f1, v1] = table[i], t = Math.log2(f / f0) / Math.log2(f1 / f0)
+    return v0 + t * (v1 - v0)
   }
-  const m = ltasToDb(ltas), lt = level(targetDb), lm = level(m)
-  for (let k = 0; k < bins; k++) raw[k] = targetDb[k] - lt - (m[k] - lm)
-  const sm = smooth(raw, { fs, oct: 1 })
-  for (let k = 1; k < bins; k++) {
-    const f = k * fs / n, o = f < lo ? Math.log2(lo / f) : f > hi ? Math.log2(f / hi) : 0
-    if (o < 0.5) out[k] = clamp(sm[k], -12, 12) * (0.5 + 0.5 * Math.cos(2 * Math.PI * o))
-  }
-  return out
+  return table[table.length - 1][1]
 }
 
 function ltasToDb(ltas) {
@@ -327,54 +318,54 @@ export function plan(analysis, opts = {}) {
     })
   }
 
-  // 9. eq: adaptive match toward the content-type (or reference) target curve over the band
-  // the target is known in (tone(): a preset's anchors; a reference's 20 Hz–0.45·fs);
-  // skipped when the resulting correction is inaudibly small. Smoothed at a full
-  // octave: this is a broad-strokes mastering correction, not a surgical parametric one,
-  // and a wider window keeps thinly-sampled bands (sparse harmonic content, near-silent
-  // octaves) from producing erratic narrow-band swings that would otherwise re-boost
-  // exactly the frequencies denoise just cleaned up.
-  {
-    const bins = analysis.ltas.length
+  // 9. eq: toward the type's target curve (spectral-target's deviation over the band the target is known in, levelled
+  // per octave, smoothed an octave: a broad-strokes correction, not a surgical one), only by what lies beyond the spread
+  // clean recordings of the type keep about it (SPREAD), × intensity; skipped under 1 dB. A voice within it gets no EQ.
+  // Speech only: Byrne et al.'s LTASS holds across talkers and languages, while Pestana et al.'s slope is the average of
+  // commercial pop mixes, not of music (a solo trumpet lies 6–7 dB past the spread of mixes and is no worse for it), and
+  // voice-music's is a convention. Reference mode matches the reference whole: there the match is the request.
+  if (reference || type === 'speech') {
+    const bins = analysis.ltas.length, n = 2 * (bins - 1)
     const targetDb = reference ? ltasToDb(reference.ltas) : targetCurve(type, { fs, bins })
-    const [lo, hi] = reference ? [20, 0.45 * fs] : TONE_BAND[type] ?? TONE_BAND.speech
-    const correction = tone(analysis.ltas, targetDb, fs, lo, Math.min(hi, 0.45 * fs))
-    for (let k = 0; k < correction.length; k++) correction[k] *= intensity
+    const correction = deviation(analysis.ltas, targetDb, { fs, smoothOct: 1 })
+    const spread = reference ? null : SPREAD
     let maxAbs = 0
-    for (let k = 0; k < correction.length; k++) maxAbs = Math.max(maxAbs, Math.abs(correction[k]))
+    for (let k = 0; k < bins; k++) {
+      const c = correction[k], over = spread ? Math.max(0, Math.abs(c) - spreadAt(spread, k * fs / n)) : Math.abs(c)
+      correction[k] = (Math.sign(c) * over * intensity) || 0
+      maxAbs = Math.max(maxAbs, Math.abs(correction[k]))
+    }
     if (maxAbs >= 1) {
       stages.push({
         atom: '@audio/eq-fir', name: 'eq',
         params: { correction: Array.from(correction), taps: 511 },
         why: reference
           ? `spectral deviation from reference LTAS, max ${maxAbs.toFixed(1)} dB (>=1 dB trigger)`
-          : `spectral deviation from ${type} target curve, max ${maxAbs.toFixed(1)} dB (>=1 dB trigger)`,
+          : `tone ${maxAbs.toFixed(1)} dB past the spread of clean voices about the speech target curve (>=1 dB trigger)`,
       })
     }
   }
 
-  // 10. multiband: light glue. Always for music-like content (2-4 kHz-split 3-band);
-  // for pure speech only when dynamics are wide (LRA > 12 LU), then a gentler 2-band
-  // split. Downward-only (upRatio 1) and ratio capped at 2 keeps it "light."
+  // 10. multiband: glue only where the take's dynamics are wider than finished programme keeps them: its loudness range
+  // (EBU Tech 3342) over 12 LU, where no clean tuning take, speech or music, came within 7 LU; its ratio by how far over
+  // (to 2), × intensity; the threshold at the take's own integrated loudness. 2-band for speech, 3-band where music is.
   const LRA_WIDE = 12
   const lra = analysis.lra ?? 0
-  const widenSpeech = !musicLike && lra > LRA_WIDE
-  if (musicLike || widenSpeech) {
+  if (lra > LRA_WIDE) {
+    const ratio = clamp(1 + intensity * (lra - LRA_WIDE) / LRA_WIDE, 1, 2)
     stages.push({
       atom: '@audio/dynamics-multiband', name: 'multiband',
       params: {
         freqs: musicLike ? [200, 2000] : [1000],
-        threshold: -24, ratio: clamp(1 + 0.5 * intensity, 1, 2),
+        threshold: Math.round(analysis.lufs ?? -24), ratio: Number(ratio.toFixed(3)),
         upThreshold: -40, upRatio: 1, depth: 1,
         attack: 5, release: 150, makeup: 0,
       },
-      why: musicLike
-        ? `content-type preset: ${type} -> gentle 3-band glue, always applied`
-        : `wide dynamics: LRA ${lra.toFixed(1)} LU (> ${LRA_WIDE} LU trigger) -> gentle 2-band glue`,
+      why: `wide dynamics: LRA ${lra.toFixed(1)} LU (> ${LRA_WIDE} LU trigger) -> ${musicLike ? 3 : 2}-band glue, ratio ${ratio.toFixed(2)}`,
     })
   }
 
-  // Reference mode: stereo width match — side-gain toward the reference's own width.
+  // Reference mode: stereo width match: side-gain toward the reference's own width.
   if (reference && reference.width != null && analysis.width != null) {
     const w = clamp(reference.width / Math.max(analysis.width, 1e-6), 0, 4)
     stages.push({
@@ -384,31 +375,46 @@ export function plan(analysis, opts = {}) {
     })
   }
 
-  // 9 in the stage catalog, but pushed here (before the limiter) because that's
-  // execution order: normalize loudness, then brickwall the peaks it may have raised.
-  const measured = analysis.lufs ?? targetLufs
-  const gainDb = clamp(targetLufs - measured, -20, 20)
-  stages.push({
-    atom: 'gain', name: 'gain',
-    params: { db: Number(gainDb.toFixed(3)) },
-    why: `loudness normalization: measured ${measured.toFixed(1)} LUFS -> target ${targetLufs} LUFS`,
-  })
-
-  // 8 in the stage catalog — always, peak ceiling (sample peaks: dynamics-limiter does not
-  // constrain inter-sample peaks, which pass it by a fraction of a dB). Reference mode
-  // tightens the ceiling to the reference's own true peak when that's the lower bound.
+  // 11. gain: toward the loudness target as far as the true peak allows under the ceiling, measured where the stage
+  // runs (after the repairs and the EQ, which move both): a quiet take is raised until its peaks reach the ceiling, as
+  // streaming normalization raises a quiet master (Spotify's, at its normal setting), and limited only by `limit` dB
+  // more: 6 dB × (intensity − 1), none at 1. On the clean tuning takes any limiting cost: PESQ 4.64 → 4.62 at 1 dB (one
+  // reading 3.91), 4.60 at all the target needs (2.6 dB median); music ODG 0.21 → 0.16, −0.03. A loud take is turned
+  // down. Reference mode reaches the reference's loudness, its limiter taking what it must, as before.
   let ceiling = opts.ceiling ?? -1
   if (reference && reference.truePeakDb != null) ceiling = Math.min(ceiling, reference.truePeakDb)
+  const limit = reference ? Infinity : 6 * Math.max(0, intensity - 1)
+  const measured = analysis.lufs ?? targetLufs, peak = analysis.truePeakDb ?? -Infinity
+  const gainDb = clamp(Math.min(targetLufs - measured, ceiling - peak + limit), -20, 20)
   stages.push({
-    atom: '@audio/dynamics-limiter', name: 'limiter',
-    params: { ceiling, lookahead: 5, release: 50 },
-    why: `peak ceiling ${ceiling.toFixed(1)} dB, always applied${reference ? ' (matched to reference true peak)' : ''}`,
+    atom: 'gain', name: 'gain',
+    params: { target: targetLufs, ceiling, limit: limit === Infinity ? 99 : limit },
+    why: `loudness toward ${targetLufs} LUFS as far as the true peak allows under ${ceiling.toFixed(1)} dBTP${limit ? ` (and ${limit === Infinity ? 'all the' : limit.toFixed(1) + ' dB of'} limiting)` : ''}: measured ${measured.toFixed(1)} LUFS, ${peak.toFixed(1)} dBTP -> about ${gainDb >= 0 ? '+' : ''}${gainDb.toFixed(1)} dB`,
   })
+
+  // 12. limiter: only where the gain may take peaks over the ceiling (limit > 0: intensity over 1, or reference mode);
+  // sample peaks: dynamics-limiter does not constrain inter-sample peaks, which pass it by a fraction of a dB.
+  if (limit > 0) {
+    stages.push({
+      atom: '@audio/dynamics-limiter', name: 'limiter',
+      params: { ceiling, lookahead: 5, release: 50 },
+      why: `peak ceiling ${ceiling.toFixed(1)} dB${reference ? ' (matched to reference true peak)' : `, at most ${limit.toFixed(1)} dB taken (intensity ${intensity})`}`,
+    })
+  }
 
   return { fs, type, intensity, targetLufs, stages }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+
+// The gain stage's dB on the sound reaching it: toward `target` LUFS, its true peak held under `ceiling` + `limit`
+// (a recipe of 0.3 carries a fixed `db`)
+function gainDb(out, p, fs) {
+  if (p.db != null) return p.db
+  const m = lufsFn(out, { fs }), tp = truepeakFn(out, { fs })
+  if (!Number.isFinite(m)) return 0
+  return clamp(Math.min(p.target - m, p.ceiling - (Number.isFinite(tp) ? tp : -Infinity) + p.limit), -20, 20)
+}
 
 function runStage(stage, out, fs) {
   const p = stage.params
@@ -463,7 +469,7 @@ function runStage(stage, out, fs) {
       if (out.length >= 2) { msEncode([out[0], out[1]]); msDecode([out[0], out[1]], { width: p.width }) }
       break
     case 'gain': {
-      const g = 10 ** (p.db / 20)
+      const g = 10 ** (gainDb(out, p, fs) / 20)
       for (const ch of out) for (let i = 0; i < ch.length; i++) ch[i] *= g
       break
     }
@@ -589,7 +595,16 @@ export function code(recipe) {
         bodyLines.push(`if (channels.length >= 2) { encode([channels[0], channels[1]]); decode([channels[0], channels[1]], ${JSON.stringify({ width: p.width })}) }`)
         break
       case 'gain':
-        bodyLines.push(`{ const g = 10 ** (${p.db} / 20); for (const ch of channels) for (let i = 0; i < ch.length; i++) ch[i] *= g }`)
+        addImport(`import lufs from '@audio/loudness-lufs'`)
+        addImport(`import truepeak from '@audio/loudness-truepeak'`)
+        bodyLines.push(p.db != null ? `{ const g = 10 ** (${p.db} / 20); for (const ch of channels) for (let i = 0; i < ch.length; i++) ch[i] *= g }` : [
+          `{`,
+          `  const m = lufs(channels, { fs }), tp = truepeak(channels, { fs })`,
+          `  const db = Number.isFinite(m) ? Math.max(-20, Math.min(20, Math.min(${p.target} - m, ${p.ceiling} - (Number.isFinite(tp) ? tp : -Infinity) + ${p.limit}))) : 0`,
+          `  const g = 10 ** (db / 20)`,
+          `  for (const ch of channels) for (let i = 0; i < ch.length; i++) ch[i] *= g`,
+          `}`,
+        ].join('\n'))
         break
       case 'limiter':
         addImport(`import limiter from '@audio/dynamics-limiter'`)

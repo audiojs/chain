@@ -10,6 +10,8 @@ import { test } from 'node:test'
 import { strict as assert } from 'node:assert'
 import { stftBatch } from '@audio/stft'
 import { BED_SNR, CLICK_RATE } from '@audio/denoise-detect'
+import targetCurve from '@audio/spectral-target'
+const targetFor = (type, bins) => targetCurve(type, { fs: 44100, bins })
 import chain, { analyze, plan, apply, code } from './chain.js'
 import { auto, chain as chainStat } from './audio.js'
 
@@ -223,7 +225,7 @@ test('analyze() detects clipping on a hard-clipped copy', () => {
 
 test('plan(dirty, speech) includes every measurement-triggered stage with a cited why', () => {
   const names = pDirty.stages.map(s => s.name)
-  for (const n of ['hpf', 'dehum', 'denoise', 'declick', 'deesser', 'eq', 'gain', 'limiter']) {
+  for (const n of ['hpf', 'dehum', 'denoise', 'declick', 'deesser', 'eq', 'gain']) {
     assert.ok(names.includes(n), `expected stage "${n}" in ${names.join(',')}`)
   }
   for (const s of pDirty.stages) assert.ok(s.why && s.why.length > 0, `stage "${s.name}" missing why`)
@@ -241,14 +243,42 @@ test('plan(dirty, speech) includes every measurement-triggered stage with a cite
 
 // ─── 4. plan(clean music, music) — adaptivity: assert the skips ───────────
 
-test('plan(clean music, music) skips dehum/denoise/declick, keeps eq/multiband/gain/limiter', () => {
+test('plan(clean music, music): no repair, no glue (LRA under 12 LU), no limiter (its peaks allow the gain)', () => {
   const names = pClean.stages.map(s => s.name)
-  assert.ok(!names.includes('dehum'), 'no hum in clean music — dehum must be skipped')
-  assert.ok(!names.includes('declick'), 'no clicks in clean music — declick must be skipped')
-  assert.ok(!names.includes('denoise'), 'no noise floor in clean music — denoise must be skipped')
-  for (const n of ['eq', 'multiband', 'gain', 'limiter']) {
-    assert.ok(names.includes(n), `expected stage "${n}" in ${names.join(',')}`)
+  for (const n of ['dehum', 'declick', 'denoise', 'declip', 'multiband', 'limiter']) assert.ok(!names.includes(n), `${n} in ${names.join(',')}`)
+  assert.ok(names.includes('gain'), names.join(','))
+})
+
+// chain 0.3 put a limiter on every take, multiband glue on every mix, and an EQ toward the type's target on any take
+// 1 dB off it: a finished master came back EQ'd, compressed and limited (clean MUSDB18 mixes: PEAQ ODG 0.21 -> -2.06).
+// A take with the target's shape, its dynamics finished, its peaks under the ceiling after the gain, gets the gain alone.
+const finished = (type, { lufs = -20, truePeakDb = -4, lra = 5 } = {}) => {
+  const bins = 2049, ltas = Float32Array.from(targetFor(type, bins), db => 10 ** (db / 20))
+  return { fs: FS, duration: 10, channels: 1, lufs, truePeakDb, lra, snr: Infinity, ltas, sibilanceDb: -20, hum: null,
+    clipping: { count: 0, ratio: 0, level: null, kind: null }, clicks: 0, voicedRatio: 0.5, reverb: null, pops: null }
+}
+test('mastering stages act on measured need: a finished take gets the gain alone, short of the target where its peaks say', () => {
+  for (const type of ['music', 'speech']) {
+    const st = plan(finished(type), { type }).stages.map(s => s.name)
+    assert.deepEqual(st, ['hpf', 'gain'], `${type}: ${st}`)
   }
+  const g = plan(finished('music'), { type: 'music' }).stages.find(s => s.name === 'gain')
+  assert.deepEqual(g.params, { target: -14, ceiling: -1, limit: 0 })
+  assert.match(g.why, /\+3\.0 dB/, 'raised until its true peak (-4) meets the ceiling (-1), not the 6 dB to -14 LUFS')
+  // wider dynamics put the glue in, by how far over; intensity 2 allows 6 dB of limiting, and the limiter with it
+  const wide = plan(finished('music', { lra: 18 }), { type: 'music' }).stages.find(s => s.name === 'multiband')
+  assert.equal(wide?.params.ratio, 1.5)
+  const loud = plan(finished('music'), { type: 'music', intensity: 2 }).stages
+  assert.equal(loud.find(s => s.name === 'gain').params.limit, 6)
+  assert.ok(loud.some(s => s.name === 'limiter'))
+  // a voice off the target by more than clean voices are gets the excess back, only that
+  const dull = finished('speech'), n = 2 * (dull.ltas.length - 1)
+  for (let k = 0; k < dull.ltas.length; k++) if (k * FS / n > 3000) dull.ltas[k] *= 10 ** (-20 / 20)
+  const eq = plan(dull, { type: 'speech' }).stages.find(s => s.name === 'eq')
+  assert.ok(eq, 'a voice 20 dB dull over 3 kHz is EQed')
+  const at = f => eq.params.correction[Math.round(f * n / FS)]
+  assert.ok(at(5000) > 1 && at(5000) < 20 - 6.9, `5 kHz: ${at(5000).toFixed(1)} dB, the excess over the spread`)
+  assert.ok(Math.abs(at(500)) < 1, `500 Hz untouched: ${at(500).toFixed(1)} dB`)
 })
 
 // ─── 4b. plan(speech) — each defect on its evidence alone ──────────────────
