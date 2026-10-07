@@ -190,10 +190,11 @@ export function analyze(channels, { fs = 44100, type } = {}) {
   const voicedRatio = voiced.length ? voiced.reduce((a, b) => a + b, 0) / voiced.length : 0
 
   // A voice's room and pops; with music in the take neither is read (a held note's sustain reads as a room, a kick as a
-  // pop). dereverb finds a diffuse tail falling slower than the voice (its dry, diffuse and pauses checks); deplosive a
+  // pop). dereverb finds a diffuse tail falling slower than the voice (its dry, diffuse and pauses checks; the take is
+  // speech by its type, so its music check stands aside: a held vowel reads to it as a held note); deplosive a
   // thump under 80 Hz rising out of nothing over the voice's band and holding without a period.
   const voice = (type ?? 'speech') === 'speech' && mono.length > 0
-  const reverb = voice ? taken(pre, dereverb(pre, { fs }), fs) : null
+  const reverb = voice ? taken(pre, dereverb(pre, { fs, music: 'enhance' }), fs) : null
   const pops = voice ? taken(pre, deplosive(Float32Array.from(pre), { fs }), fs) : null
 
   const analysis = {
@@ -324,7 +325,7 @@ export function plan(analysis, opts = {}) {
   if (type === 'speech' && analysis.reverb?.db > REVERB_MIN) {
     stages.push({
       atom: '@audio/denoise-dereverb', name: 'dereverb',
-      params: { strength: intensity },
+      params: { strength: intensity, music: 'enhance' },
       why: `late reverberation: a diffuse tail, ${analysis.reverb.db.toFixed(1)} dB of the take (dereverb's dry, diffuse and pauses checks)`,
     })
   }
