@@ -13,10 +13,13 @@ import lraFn from '@audio/loudness-lra'
 import { vad } from '@audio/vad'
 import { classify, CLICK_RATE, BED_SNR } from '@audio/denoise-detect'
 import ltasFn from '@audio/spectral-ltas'
-import targetCurve, { deviation } from '@audio/spectral-target'
+import targetCurve, { smooth } from '@audio/spectral-target'
 import dehum from '@audio/denoise-dehum'
 import omlsa from '@audio/denoise-omlsa'
 import declick from '@audio/denoise-declick'
+import declip, { rails, bands } from '@audio/denoise-declip'
+import dereverb from '@audio/denoise-dereverb'
+import deplosive from '@audio/denoise-deplosive'
 import deesser from '@audio/dynamics-deesser'
 import multiband from '@audio/dynamics-multiband'
 import limiter from '@audio/dynamics-limiter'
@@ -25,12 +28,18 @@ import highpass from '@audio/filter-biquad/highpass'
 import { encode as msEncode, decode as msDecode } from '@audio/spatial-midside'
 
 // LTAS analysis window — spectral-ltas / spectral-target's own shared default
-// (bins = 4096/2+1 = 2049), so target()/deviation() need no explicit `bins` override.
+// (bins = 4096/2+1 = 2049), so target() needs no explicit `bins` override.
 const LTAS_FRAME = 4096
 // EBU-informed loudness targets (todo.md Stage 2): speech/voice-music -16 LUFS, music -14.
 const DEFAULT_LUFS = { speech: -16, music: -14, 'voice-music': -16 }
 
 const clamp = (x, lo, hi) => x < lo ? lo : x > hi ? hi : x
+
+// What dereverb and deplosive take, dB re the take, over which a room or pops are a defect to repair. On the speech
+// tuning takes of audio's bench/rx/assistant.mjs, dereverb took −12.7 dB or more from every take in a room, and from
+// the readings' own mild rooms −21 to −31 dB (PESQ against them 4.64 → 4.15–4.60); deplosive took −21.4 dB or more
+// from every take with pops, and from the rest down to −65 (a voice's own low end at a word's onset).
+const REVERB_MIN = -20, POPS_MIN = -22
 
 // Accept a bare mono Float32Array the same way every dependency kernel does.
 const toChannels = (channels) => channels[0]?.length === undefined ? [channels] : channels
@@ -42,19 +51,47 @@ function toMono(channels) {
   return mono
 }
 
-// Runs of consecutive |x| >= 0.999 (>=2 samples), summed across channels.
+// Clipping, by declip's own evidence, per channel: a rail (the samples a hard clip cut piled onto one level, in runs:
+// FFmpeg adeclip's top-bin test, relative to the rail) or, with none, a band (a rail lossy coding spread: a mode at the
+// extreme with mass either side of it). count: runs of 2 or more at a rail (or over a band's cut); ratio: the share of
+// samples there; level: the lowest rail, dBFS; kind: 'rail', 'band' or null. declip rebuilds exactly these samples.
+const TAU = 1e-3, KAPPA = 6        // declip's: a rail's width (share of the rail), a band's cut (spreads under its mode)
 function detectClipping(channels) {
-  let count = 0, clipped = 0, total = 0
+  let count = 0, clipped = 0, total = 0, level = Infinity, kind = null
   for (const ch of channels) {
     total += ch.length
+    let { hi, lo } = rails(ch), band = false
+    if (hi == null && lo == null) {
+      const b = bands(ch), cut = (m, s) => m && m.r - KAPPA * m.s > 0 ? s * (m.r - KAPPA * m.s) : null
+      hi = cut(b.hi, 1); lo = cut(b.lo, -1); band = hi != null || lo != null
+    }
+    if (hi == null && lo == null) continue
+    kind = kind === 'rail' || !band ? 'rail' : 'band'
+    const th = hi == null ? Infinity : band ? hi : hi * (1 - TAU), tl = lo == null ? -Infinity : band ? lo : lo * (1 - TAU)
+    for (const r of [hi, lo]) if (r != null) level = Math.min(level, 20 * Math.log10(Math.abs(r)))
     let run = 0
-    for (let i = 0; i < ch.length; i++) {
-      if (Math.abs(ch[i]) >= 0.999) { run++; clipped++ }
+    for (let i = 0; i <= ch.length; i++) {
+      if (i < ch.length && (ch[i] >= th || ch[i] <= tl)) { run++; clipped++ }
       else { if (run >= 2) count++; run = 0 }
     }
-    if (run >= 2) count++
   }
-  return { count, ratio: total ? clipped / total : 0 }
+  return { count, ratio: total ? clipped / total : 0, level: kind ? level : null, kind }
+}
+
+// What a self-gating repair takes from x: null when y comes back bit for bit, else the energy taken re x, dB (and the
+// spans it moved: runs of changed samples, 50 ms apart or more, for pops)
+function taken(x, y, fs) {
+  let e = 0, p = 0, spans = 0, last = -Infinity
+  const gap = 0.05 * fs
+  for (let i = 0; i < x.length; i++) {
+    const d = y[i] - x[i]
+    p += x[i] * x[i]
+    if (d === 0) continue
+    e += d * d
+    if (i - last > gap) spans++
+    last = i
+  }
+  return e > 0 ? { db: 10 * Math.log10(e / p), spans } : null
 }
 
 // Mean of a per-bin curve (linear or dB, caller's choice) over [lo, hi] Hz.
@@ -64,6 +101,30 @@ function bandMean(curve, fs, frameSize, lo, hi) {
   let sum = 0, n = 0
   for (let k = k0; k <= k1; k++) { sum += curve[k]; n++ }
   return n ? sum / n : 0
+}
+
+// The tone correction toward a target (dB per bin): target − measured, each levelled by its mean over [lo, hi] in log
+// frequency (every octave weighs alike), smoothed an octave (spectral-target's smooth), clamped ±12 dB, faded to 0 over
+// the half octave outside [lo, hi], where the target is not known. spectral-target's deviation() levels each curve by
+// the mean of its bins over 20 Hz–0.45·fs, half of which lie in the octave over 10 kHz: clean VoiceBank speech against
+// Byrne et al.'s LTASS (held flat past its last anchor, 10 kHz) read 12 dB over the target in every band under 4 kHz and
+// was given +8.5 dB at 16 kHz (the EQ alone took clean takes' PESQ 4.64 → 4.27).
+const TONE_BAND = { speech: [100, 10000], music: [100, 4000], 'voice-music': [100, 10000] }   // the targets' anchors
+function tone(ltas, targetDb, fs, lo, hi) {
+  const bins = ltas.length, n = 2 * (bins - 1), raw = new Float32Array(bins), out = new Float32Array(bins)
+  const level = d => {
+    let s = 0, w = 0
+    for (let k = Math.max(1, Math.ceil(lo * n / fs)); k <= Math.min(bins - 1, Math.floor(hi * n / fs)); k++) s += d[k] / k, w += 1 / k
+    return w ? s / w : 0
+  }
+  const m = ltasToDb(ltas), lt = level(targetDb), lm = level(m)
+  for (let k = 0; k < bins; k++) raw[k] = targetDb[k] - lt - (m[k] - lm)
+  const sm = smooth(raw, { fs, oct: 1 })
+  for (let k = 1; k < bins; k++) {
+    const f = k * fs / n, o = f < lo ? Math.log2(lo / f) : f > hi ? Math.log2(f / hi) : 0
+    if (o < 0.5) out[k] = clamp(sm[k], -12, 12) * (0.5 + 0.5 * Math.cos(2 * Math.PI * o))
+  }
+  return out
 }
 
 function ltasToDb(ltas) {
@@ -86,7 +147,7 @@ function measureWidth(channels) {
 
 // ─────────────────────────────────────────────────────────────────────────
 
-export function analyze(channels, { fs = 44100 } = {}) {
+export function analyze(channels, { fs = 44100, type } = {}) {
   channels = toChannels(channels)
   const duration = channels[0].length / fs
   const mono = toMono(channels)
@@ -104,22 +165,38 @@ export function analyze(channels, { fs = 44100 } = {}) {
   const clipping = detectClipping(channels)
 
   // The defects, by @audio/denoise-detect's evidence (its README has the confusion matrix):
-  // each needs positive evidence, so a clean take reads no hum, no clicks and no bed. Its
-  // routing is a priority order; its scores are independent, and plan() reads each. Hum is
-  // dehum's own measurement, A-weighted against the program (method 'dehum' is first in the
-  // order, so it is exactly the audible-hum verdict).
-  const { method, scores } = classify(mono, fs)
-  const hum = method === 'dehum' ? { freq: scores.humFreq, harmonics: scores.hum, level: scores.humLevel } : null
+  // each needs positive evidence, so a clean take reads no clicks and no bed. Its scores are
+  // independent, and plan() reads each.
+  const { scores } = classify(mono, fs)
   const clicks = scores.click, snr = scores.snr
+
+  // The repairs that judge for themselves (dehum, deplosive, dereverb) are run here on the mono mix, as the plan hands
+  // it to them: past declick, which runs before each (an isolated click, a jump out of nothing, reads to dereverb as a
+  // fall no room allows). Each returns a take it finds nothing in bit for bit; what it took is the evidence.
+  const pre = clicks > CLICK_RATE ? declick(Float32Array.from(mono), { fs }) : mono
+
+  // Hum, by dehum's own detection: its measurement of the whole take, else lines tracked along the 50 and 60 Hz series
+  // (hum under music, too faint over the whole take for one transform). denoise-detect's verdict (its series by the one
+  // transform, A-weighted within 50 dB of the program) found 26 % of the speech tuning takes' hum 20–35 dB under the
+  // voice, dehum 45 %. freq, harmonics, level: denoise-detect's measured series, when it found one.
+  const humTaken = pre.length ? taken(pre, dehum(Float32Array.from(pre), { fs }), fs) : null
+  const hum = humTaken ? { freq: scores.humFreq || null, harmonics: scores.hum, level: scores.humLevel, taken: humTaken.db } : null
 
   const { voiced } = vad(mono, { fs })
   const voicedRatio = voiced.length ? voiced.reduce((a, b) => a + b, 0) / voiced.length : 0
+
+  // A voice's room and pops; with music in the take neither is read (a held note's sustain reads as a room, a kick as a
+  // pop). dereverb finds a diffuse tail falling slower than the voice (its dry, diffuse and pauses checks); deplosive a
+  // thump under 80 Hz rising out of nothing over the voice's band and holding without a period.
+  const voice = (type ?? 'speech') === 'speech' && mono.length > 0
+  const reverb = voice ? taken(pre, dereverb(pre, { fs }), fs) : null
+  const pops = voice ? taken(pre, deplosive(Float32Array.from(pre), { fs }), fs) : null
 
   const analysis = {
     fs, duration, channels: channels.length,
     lufs, truePeakDb, lra,
     snr, ltas, sibilanceDb,
-    hum, clipping, clicks, voicedRatio,
+    hum, clipping, clicks, voicedRatio, reverb, pops,
   }
   // Stereo width — only meaningful (and only cheap) for >=2 channels; consumed by
   // reference-mode's width-match stage (see plan()). Not in the illustrative shape
@@ -147,32 +224,73 @@ export function plan(analysis, opts = {}) {
 
   const stages = []
 
-  // 1. hpf — always: DC/rumble guard. 25 Hz for music-like content (preserve bass under
-  // a bed mix), 40 Hz for pure speech (nothing useful below it).
-  const hpfHz = musicLike ? 25 : 40
+  // Repairs first, in the order the damage is undone (the last done first: iZotope's own chain, RX 12 Repair
+  // Assistant's, de-clip, de-click, de-hum, de-noise, de-reverb, de-ess), then the tone and level stages. Each repair
+  // stands on its own evidence; a clean take gets none.
+
+  // 1. declip: on declip's own evidence (a rail, or a band lossy coding spread). First: every other stage moves the
+  // samples off the rails it rebuilds from (a highpass alone tilts a flat top). The kernel's defaults.
+  const clip = analysis.clipping
+  if (clip?.kind) {
+    stages.push({
+      atom: '@audio/denoise-declip', name: 'declip',
+      params: {},
+      why: `clipped: ${clip.count} runs at ${clip.kind === 'band' ? 'a coded rail' : 'the rails'}, ${clip.level.toFixed(1)} dBFS, ${(100 * clip.ratio).toFixed(2)} % of samples`,
+    })
+  }
+
+  // 2. declick: only if denoise-detect's own click rate clears its declick threshold
+  // (CLICK_RATE, the one that package selects its declick branch at). Kernel defaults. Before the
+  // highpass, which would ring on each click and spread it.
+  if (analysis.clicks > CLICK_RATE) {
+    stages.push({
+      atom: '@audio/denoise-declick', name: 'declick',
+      params: {},
+      why: `impulsive clicks, ${analysis.clicks.toFixed(1)} a second (> ${CLICK_RATE} trigger)`,
+    })
+  }
+
+  // 3. deplosive: speech alone (a kick drum is a pop to it), where deplosive's own detection (a thump under 80 Hz
+  // rising out of nothing over the voice's band, without a period) takes over POPS_MIN of the take. Before the
+  // highpass, which leaves its response to a pop's edges behind. The kernel's defaults.
+  if (type === 'speech' && analysis.pops?.db > POPS_MIN) {
+    stages.push({
+      atom: '@audio/denoise-deplosive', name: 'deplosive',
+      params: {},
+      why: `plosive pops: ${analysis.pops.spans} taken, ${analysis.pops.db.toFixed(1)} dB of the take`,
+    })
+  }
+
+  // 4. hpf: always: DC/rumble guard. 40 Hz for pure speech (nothing useful below it); 20 Hz, the bottom of hearing, for
+  // music-like content: at 0.3's 25 Hz the guard took the sub-bass out of 4 of the 32 tuning mixes (PEAQ ODG under
+  // −0.5; mean 0.06 against 0.17 at 20 Hz, 0.21 untouched).
+  const hpfHz = musicLike ? 20 : 40
   stages.push({
     atom: '@audio/filter-biquad', name: 'hpf',
     params: { fc: hpfHz, order: 2, Q: 0.707 },
     why: `DC/rumble guard, always applied — ${hpfHz} Hz highpass (${type} convention)`,
   })
 
-  // 2. dehum — only on denoise-detect's hum verdict. dehum measures the series' exact
-  // frequency itself (within ±0.4 % of `freq`) and takes every harmonic up to 1 kHz.
+  // 5. dehum: on dehum's own detection (analyze()); it finds the series again, tracks its exact frequency and takes
+  // every harmonic to 1 kHz and every line over it to 8 kHz. The kernel's defaults.
   if (analysis.hum) {
-    const { freq, harmonics, level } = analysis.hum
+    const { freq, taken } = analysis.hum
     stages.push({
       atom: '@audio/denoise-dehum', name: 'dehum',
-      params: { freq },
-      why: `mains hum at ${freq.toFixed(2)} Hz, ${harmonics} lines, ${level.toFixed(1)} dB(A) re the program (audible: denoise-detect's dehum verdict)`,
+      params: {},
+      why: `mains hum${freq ? ` at ${freq.toFixed(2)} Hz` : ''}: ${taken.toFixed(1)} dB of the take (dehum's own detection)`,
     })
   }
 
-  // 3. denoise — only on a noise bed within BED_SNR of the program, shown in its pauses or held
+  // 6. denoise: speech-bearing types, only on a noise bed within BED_SNR of the program, shown in its pauses or held
   // at its bands' floor. omlsa, as denoise-detect routes every bed (STOI +0.007 over wiener on
   // ~1000 takes: its README), tracks the bed itself (IMCRA, Cohen 2003), so a bed that changes
-  // over the take is followed, held notes not learned. `intensity` scales the floor the noise
-  // is taken to from the kernel's −15 dB.
-  if (analysis.snr < BED_SNR) {
+  // over the take is followed. Not on music: tracking a dense mix it takes held parts of the mix for the bed (clean
+  // MUSDB18 previews through it: SDR 4–9 dB to themselves), and on every music take of the tuning split it went on
+  // (beds 15–35 dB under the mix, and three clean mixes whose steady parts read as one) it left the take further from
+  // the clean mix than it came (SI-SDR −1.8 to −10.7 dB) and PEAQ's grade no better. `intensity` scales the floor the
+  // noise is taken to from the kernel's −15 dB.
+  if (speechLike && analysis.snr < BED_SNR) {
     stages.push({
       atom: '@audio/denoise-omlsa', name: 'denoise',
       params: { gMin: clamp(-15 * intensity, -30, -2) },
@@ -180,40 +298,47 @@ export function plan(analysis, opts = {}) {
     })
   }
 
-  // 4. declick — only if denoise-detect's own click rate clears its declick threshold
-  // (CLICK_RATE, the one that package selects its declick branch at). Kernel defaults.
-  if (analysis.clicks > CLICK_RATE) {
+  // 7. dereverb: speech alone (a held note's sustain reads as a room), where its own checks find a diffuse tail falling
+  // slower than the voice (dry takes pass it bit for bit) and it takes over REVERB_MIN of the take. After the denoiser:
+  // a bed under the voice reads as a tail that never falls. `intensity` scales the late estimate (`strength`, the
+  // kernel's 1).
+  if (type === 'speech' && analysis.reverb?.db > REVERB_MIN) {
     stages.push({
-      atom: '@audio/denoise-declick', name: 'declick',
-      params: {},
-      why: `impulsive clicks — ${analysis.clicks.toFixed(1)} a second (> ${CLICK_RATE} trigger)`,
+      atom: '@audio/denoise-dereverb', name: 'dereverb',
+      params: { strength: intensity },
+      why: `late reverberation: a diffuse tail, ${analysis.reverb.db.toFixed(1)} dB of the take (dereverb's dry, diffuse and pauses checks)`,
     })
   }
 
-  // 5. deesser — speech-bearing types only, only once sibilance clears the mid-band
+  // 8. deesser: speech-bearing types only, only once sibilance clears the mid-band
   // ratio. The kernel judges each 's' itself (its band over the voice body, dB, against
-  // its tuned threshold) and cuts by how far it rises; `intensity` scales the deepest cut
-  // from its −6 dB `range`, past which an 's' turns into a lisp (dynamics-deesser README).
-  const SIB_ON = -8
+  // its threshold) and cuts the band over its split by how far it rises (its default mode, 'split': with no 's' the
+  // input passes sample for sample); `intensity` scales the deepest cut from its −8 dB `range`. One take can't tell a
+  // sibilant speaker from a harsh recording: on the tuning takes, harsh ones (sibilants 4–12 dB up) and the rest overlap
+  // on this ratio and on the deesser's own mean cut alike, and the deesser gains a harsh take PESQ 0.15 where it costs a
+  // clean one 0.03. −6 dB keeps 56 % of the harsh takes at 9 % of the rest (−8: 69 % at 22 %; summed PESQ over the
+  // tuning takes −0.12 against −0.92).
+  const SIB_ON = -6
   if (speechLike && analysis.sibilanceDb > SIB_ON) {
     stages.push({
       atom: '@audio/dynamics-deesser', name: 'deesser',
-      params: { mode: 'band', range: -6 * intensity || 0 },   // || 0: no −0 in the recipe
+      params: { range: -8 * intensity || 0 },   // || 0: no −0 in the recipe
       why: `sibilance ${analysis.sibilanceDb.toFixed(1)} dB rel. 1-4 kHz band (> ${SIB_ON} dB trigger)`,
     })
   }
 
-  // 6. eq — adaptive match toward the content-type (or reference) target curve;
+  // 9. eq: adaptive match toward the content-type (or reference) target curve over the band
+  // the target is known in (tone(): a preset's anchors; a reference's 20 Hz–0.45·fs);
   // skipped when the resulting correction is inaudibly small. Smoothed at a full
-  // octave (vs. deviation()'s own 1/3-oct default) — this is a broad-strokes mastering
-  // correction, not a surgical parametric one, and a wider window keeps thinly-sampled
-  // bands (sparse harmonic content, near-silent octaves) from producing erratic
-  // narrow-band swings that would otherwise re-boost exactly the frequencies denoise
-  // just cleaned up.
+  // octave: this is a broad-strokes mastering correction, not a surgical parametric one,
+  // and a wider window keeps thinly-sampled bands (sparse harmonic content, near-silent
+  // octaves) from producing erratic narrow-band swings that would otherwise re-boost
+  // exactly the frequencies denoise just cleaned up.
   {
     const bins = analysis.ltas.length
     const targetDb = reference ? ltasToDb(reference.ltas) : targetCurve(type, { fs, bins })
-    const correction = deviation(analysis.ltas, targetDb, { fs, smoothOct: 1 })
+    const [lo, hi] = reference ? [20, 0.45 * fs] : TONE_BAND[type] ?? TONE_BAND.speech
+    const correction = tone(analysis.ltas, targetDb, fs, lo, Math.min(hi, 0.45 * fs))
     for (let k = 0; k < correction.length; k++) correction[k] *= intensity
     let maxAbs = 0
     for (let k = 0; k < correction.length; k++) maxAbs = Math.max(maxAbs, Math.abs(correction[k]))
@@ -228,7 +353,7 @@ export function plan(analysis, opts = {}) {
     }
   }
 
-  // 7. multiband — light glue. Always for music-like content (2-4 kHz-split 3-band);
+  // 10. multiband: light glue. Always for music-like content (2-4 kHz-split 3-band);
   // for pure speech only when dynamics are wide (LRA > 12 LU), then a gentler 2-band
   // split. Downward-only (upRatio 1) and ratio capped at 2 keeps it "light."
   const LRA_WIDE = 12
@@ -292,10 +417,19 @@ function runStage(stage, out, fs) {
       for (let c = 0; c < out.length; c++) out[c] = highpass(out[c], { fc: p.fc, order: p.order, Q: p.Q, fs })
       break
     case 'dehum':
-      for (let c = 0; c < out.length; c++) out[c] = dehum(out[c], { freq: p.freq, fs })
+      for (let c = 0; c < out.length; c++) out[c] = dehum(out[c], { ...p, fs })
+      break
+    case 'declip':
+      for (let c = 0; c < out.length; c++) out[c] = declip(out[c], { ...p, fs })
+      break
+    case 'deplosive':
+      for (let c = 0; c < out.length; c++) deplosive(out[c], { ...p, fs })
       break
     case 'denoise':
       for (let c = 0; c < out.length; c++) out[c] = omlsa(out[c], { fs, gMin: p.gMin })
+      break
+    case 'dereverb':
+      for (let c = 0; c < out.length; c++) out[c] = dereverb(out[c], { ...p, fs })
       break
     case 'declick':
       for (let c = 0; c < out.length; c++) out[c] = declick(out[c], { ...p, fs })
@@ -376,7 +510,7 @@ export function apply(channels, recipe, { fs = 44100 } = {}) {
 
 export default function chain(channels, opts = {}) {
   const fs = opts.fs ?? 44100
-  const analysis = analyze(channels, { fs })
+  const analysis = analyze(channels, { fs, type: opts.type })
   const recipe = plan(analysis, opts)
   const outChannels = apply(channels, recipe, { fs })
   return { channels: outChannels, recipe, analysis }
@@ -405,7 +539,19 @@ export function code(recipe) {
         break
       case 'dehum':
         addImport(`import dehum from '@audio/denoise-dehum'`)
-        bodyLines.push(`for (const ch of channels) dehum(ch, ${JSON.stringify({ freq: p.freq, fs })})`)
+        bodyLines.push(`for (const ch of channels) dehum(ch, ${JSON.stringify({ ...p, fs })})`)
+        break
+      case 'declip':
+        addImport(`import declip from '@audio/denoise-declip'`)
+        bodyLines.push(`channels.forEach((ch, i) => { channels[i] = declip(ch, ${JSON.stringify({ ...p, fs })}) })`)
+        break
+      case 'deplosive':
+        addImport(`import deplosive from '@audio/denoise-deplosive'`)
+        bodyLines.push(`for (const ch of channels) deplosive(ch, ${JSON.stringify({ ...p, fs })})`)
+        break
+      case 'dereverb':
+        addImport(`import dereverb from '@audio/denoise-dereverb'`)
+        bodyLines.push(`channels.forEach((ch, i) => { channels[i] = dereverb(ch, ${JSON.stringify({ ...p, fs })}) })`)
         break
       case 'denoise':
         addImport(`import omlsa from '@audio/denoise-omlsa'`)

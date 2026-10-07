@@ -71,7 +71,7 @@ function median(arr) {
 
 // ─── fixtures ───────────────────────────────────────────────────────────────
 
-// "speech" — ~4 s. Voiced buzz (230 Hz band-limited sawtooth, 8 partials) AM'd at a 2 Hz
+// "speech": ~4 s. Voiced buzz (245 Hz band-limited sawtooth, 8 partials) AM'd at a 2 Hz
 // syllable rate with true zero-amplitude gaps between syllables + 6.5-8 kHz sibilant bursts
 // (120 ms, raised-cosine: a gated burst's edges are clicks to denoise-detect, 2 a second).
 // The defects, each optional — all on, the "dirty" take; all off, the clean one:
@@ -80,16 +80,16 @@ function median(arr) {
 //  - clicks: 13 doublets, one every 0.3 s (3 a second, CLICK_RATE 1).
 //
 // Two deliberate choices, both load-bearing:
-//  - Voice fundamental is 230 Hz: its partials under 1 kHz (230, 460, 690, 920) stay off
-//    the 50 and 60 Hz series dehum removes up to 1 kHz. A steady synthetic partial on a mains
-//    harmonic is a line to dehum (150 Hz = 3 x 50; 220 Hz put its 3rd on 660 = 11 x 60),
-//    and goes with the hum.
+//  - Voice fundamental is 245 Hz: its partials (245·k to 1960 Hz) stay 5 Hz or more off every
+//    multiple of 50 and 60, the most any fundamental near it keeps. A steady synthetic partial on a
+//    mains harmonic is a line to dehum, and goes with the hum: dehum 0.5 takes the lines to 8 kHz,
+//    and 230 Hz put its 6th on 1380 = 23 x 60 (the hum fixture's error re clean -23.1 -> -24.2 dB).
 //  - Syllable rate is 2 Hz, not ~4 Hz: 250 ms gaps, several times denoise-omlsa's ~23 ms
 //    frame, so the gap-floor measurement in test 5 reads settled frames, not the STFT-smeared
 //    edges of the syllables around them.
 function speech({ hum = true, noise = true, clicks = true } = {}) {
   const dur = 4, n = Math.round(dur * FS)
-  const carrier = saw(230, n, 8)
+  const carrier = saw(245, n, 8)
   const out = new Float32Array(n)
   const SYL_HZ = 2
   for (let i = 0; i < n; i++) {
@@ -253,7 +253,7 @@ test('plan(clean music, music) skips dehum/denoise/declick, keeps eq/multiband/g
 
 // ─── 4b. plan(speech) — each defect on its evidence alone ──────────────────
 
-const REPAIR = ['dehum', 'denoise', 'declick']
+const REPAIR = ['declip', 'declick', 'deplosive', 'dehum', 'denoise', 'dereverb']
 const cleanTake = speech({ hum: false, noise: false, clicks: false })
 const repairs = (x) => plan(analyze([x], { fs: FS }), { type: 'speech' }).stages.filter(s => REPAIR.includes(s.name))
 // error of y re x, dB
@@ -272,26 +272,95 @@ test('plan(clean speech) repairs nothing: no hum, no bed, no clicks evidenced', 
 // with a 1025-bin profile frozen from the take's last second.
 test('each defect alone puts in its own stage, with the kernels\' current params, and that stage repairs it', () => {
   for (const [defect, name, check] of [
-    ['hum', 'dehum', p => { assert.deepEqual(Object.keys(p), ['freq']); assert.ok(Math.abs(p.freq - 60) < 0.3, `freq ${p.freq}`) }],
+    ['hum', 'dehum', p => assert.deepEqual(p, {})],
     ['noise', 'denoise', p => assert.deepEqual(p, { gMin: -15 })],
     ['clicks', 'declick', p => assert.deepEqual(p, {})],
   ]) {
     const x = speech({ hum: false, noise: false, clicks: false, [defect]: true }), st = repairs(x)
     assert.deepEqual(st.map(s => s.name), [name], `${defect} alone`)
     check(st[0].params)
-    // the stage alone, through apply(): error re the clean take, measured -23.1 -> -80.3 dB (hum),
-    // -16.7 -> -23.3 (noise), -21.3 -> -66.4 (clicks)
+    // the stage alone, through apply(): error re the clean take, measured -23.1 -> -28.6 dB (hum: its lines down
+    // 73 dB, what is left the voice's own sidebands on the 60 Hz lines dehum 0.5 takes to 8 kHz, the steady
+    // synthetic voice AM'd at 2 Hz; 0.4's lines to 1 kHz left -80.3), -16.7 -> -23.3 (noise), -21.3 -> -66.4 (clicks)
     const y = apply([x], { fs: FS, targetLufs: -16, stages: st }, { fs: FS })[0]
     const before = errDb(x, cleanTake), after = errDb(y, cleanTake)
-    assert.ok(after < before - { hum: 40, noise: 5, clicks: 30 }[defect], `${name}: error re clean ${before.toFixed(1)} -> ${after.toFixed(1)} dB`)
+    assert.ok(after < before - { hum: 5, noise: 5, clicks: 30 }[defect], `${name}: error re clean ${before.toFixed(1)} -> ${after.toFixed(1)} dB`)
+    if (defect === 'hum') for (const f of [60, 120, 180]) assert.ok(goertzelDb(x, f, FS) - goertzelDb(y, f, FS) > 40, `${f} Hz down ${(goertzelDb(x, f, FS) - goertzelDb(y, f, FS)).toFixed(1)} dB`)
+  }
+})
+
+// chain 0.3 had no declip, deplosive or dereverb: a clipped, a popped and a reverberant take went unrepaired.
+// Clipped: the clean take 12 dB hotter into rails at ±0.5. Popped: a pressure pulse (a 40 ms raised-cosine, through a
+// 150 Hz low-pass) at each syllable's onset, at the voice's peak. Reverberant: the take through a room of 0.5 s (T60),
+// its tail decaying exponentially (Polack's diffuse field) under the direct sound, 6 dB under it in energy.
+function lowpass1(x, fc) { const a = Math.exp(-2 * Math.PI * fc / FS); let y = 0; return x.map(v => y = (1 - a) * v + a * y) }
+const hot = cleanTake.map(v => 4 * v), clipped = hot.map(v => Math.max(-0.5, Math.min(0.5, v)))
+const popped = (() => {
+  const x = Float32Array.from(cleanTake), L = Math.round(0.04 * FS), p = new Float32Array(L)
+  for (let i = 0; i < L; i++) p[i] = Math.sin(Math.PI * i / L) ** 2
+  const lp = lowpass1(lowpass1(p, 150), 150), pk = Math.max(...lp)
+  for (let t = 0; t < 4; t += 0.5) { const at = Math.round(t * FS); for (let i = 0; i < L && at + i < x.length; i++) x[at + i] += 0.5 * lp[i] / pk }
+  return x
+})()
+const inRoom = tail => {
+  // the tail as velvet noise (Järveläinen & Karjalainen 2007): one ±1 impulse per 0.5 ms cell, a sparse diffuse field
+  const L = Math.round(0.6 * FS), cell = Math.round(0.0005 * FS), tau = 0.5 / 6.91 * FS, r = lcgNoise(2 * Math.ceil(L / cell), 1, 23), taps = []
+  let e = 0
+  for (let c = 1, j = 0; c * cell < L; c++, j += 2) { const at = c * cell + Math.floor((r[j] + 1) / 2 * cell), g = Math.sign(r[j + 1]) * Math.exp(-at / tau); taps.push([at, g]); e += g * g }
+  for (const t of taps) t[1] *= Math.sqrt(tail / e)
+  const y = Float32Array.from(cleanTake)
+  for (let i = 0; i < y.length; i++) { const v = cleanTake[i]; if (v) for (const [at, g] of taps) if (i + at < y.length) y[i + at] += v * g }
+  return y
+}
+const room = inRoom(0.25)
+
+test('a clipped, a popped and a reverberant take each put in their repair, on its own evidence, and it repairs', () => {
+  for (const [x, name, ref, gain] of [[clipped, 'declip', hot, 3], [popped, 'deplosive', cleanTake, 6], [room, 'dereverb', null, 0]]) {
+    const a = analyze([x], { fs: FS }), st = plan(a, { type: 'speech' }).stages
+    assert.ok(st.some(s => s.name === name), `${name}: ${st.map(s => s.name).join(',')}`)
+    if (!ref) continue
+    const y = apply([x], { fs: FS, targetLufs: -16, stages: st.filter(s => s.name === name) }, { fs: FS })[0]
+    const before = errDb(x, ref), after = errDb(y, ref)
+    assert.ok(after < before - gain, `${name}: error re the take before the damage ${before.toFixed(1)} -> ${after.toFixed(1)} dB`)
+  }
+  assert.equal(analyze([clipped], { fs: FS }).clipping.kind, 'rail')
+  assert.equal(analyze([cleanTake], { fs: FS }).clipping.kind, null)
+  // a room 30 dB under the voice, what a reading at home keeps: what dereverb would take stays under 1 % of the take
+  const mild = analyze([inRoom(0.001)], { fs: FS })
+  assert.ok(!(mild.reverb?.db > -20), `mild room: dereverb takes ${mild.reverb?.db}`)
+  assert.ok(!plan(mild, { type: 'speech' }).stages.some(s => s.name === 'dereverb'))
+})
+
+// chain 0.3 ran its highpass first: it rang on each click and spread it before declick could find it, and a
+// clipped take's flat tops were tilted off the rails before any declip could read them.
+test('repairs run first, in the order the damage is undone: declip, declick, deplosive, then the highpass', () => {
+  const names = pDirty.stages.map(s => s.name)
+  assert.ok(names.indexOf('declick') < names.indexOf('hpf'), names.join(','))
+  const st = plan(analyze([clipped], { fs: FS }), { type: 'speech' }).stages.map(s => s.name)
+  assert.equal(st[0], 'declip', st.join(','))
+})
+
+// chain 0.3 drew the EQ with spectral-target's deviation(), levelled by the mean of its bins over 20 Hz–0.45·fs: the
+// octaves over 5 kHz outweighed the rest, and a voice read 12 dB over its target under 4 kHz and was lifted up to 16 kHz.
+// Now the correction is drawn where the target is known (speech: Byrne's 100 Hz–10 kHz; music: Pestana's 100 Hz–4 kHz)
+// and fades to 0 within half an octave outside.
+test('the EQ is drawn where its target is known: 0 past half an octave outside it', () => {
+  for (const [recipe, hi] of [[pDirty, 10000], [pClean, 4000]]) {
+    const c = recipe.stages.find(s => s.name === 'eq')?.params.correction
+    if (!c) continue
+    const n = 2 * (c.length - 1)
+    for (let k = 1; k < c.length; k++) {
+      const f = k * FS / n
+      if (f >= hi * Math.SQRT2 || f <= 100 / Math.SQRT2) assert.equal(c[k], 0, `${recipe.type}: ${f.toFixed(0)} Hz corrected ${c[k]}`)
+    }
   }
 })
 
 test('intensity scales denoise\'s floor and the deesser\'s deepest cut, not whether they fire', () => {
-  for (const [intensity, gMin, range] of [[0, -2, 0], [0.5, -7.5, -3], [1, -15, -6], [2, -30, -12]]) {
+  for (const [intensity, gMin, range] of [[0, -2, 0], [0.5, -7.5, -4], [1, -15, -8], [2, -30, -16]]) {
     const st = plan(aDirty, { type: 'speech', intensity }).stages, by = n => st.find(s => s.name === n).params
     assert.equal(by('denoise').gMin, gMin, `intensity ${intensity}: gMin`)
-    assert.equal(by('deesser').mode, 'band')
+    assert.equal(by('deesser').mode, undefined, 'the kernel\'s own mode (split: the band over 3.5 kHz alone)')
     assert.equal(by('deesser').range, range, `intensity ${intensity}: range`)
     assert.equal(by('deesser').threshold, undefined, 'the kernel\'s own threshold (sibilance band over the voice body)')
   }
@@ -427,6 +496,13 @@ test('edge cases: empty, one sample, shorter than every window, silence — no t
 })
 
 // ─── 9. audio.js manifest — auto processor + chain stat ───────────────────
+
+// chain 0.3 declared targetLufs -30..-6 with the sentinel 0 (the type's default) as its default: audio clamps a default
+// into the declared range, so its auto() normalized every take to -6 LUFS, pushing a speech take 10 dB into the limiter.
+test('manifest: the targetLufs sentinel survives a host clamping the default into its range', () => {
+  const p = auto.params.targetLufs
+  assert.equal(Math.min(p.max, Math.max(p.min, p.default)), 0)
+})
 
 test('manifest: auto processes a buffer without NaN, chain stat returns a recipe', () => {
   const ctx = {

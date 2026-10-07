@@ -1,8 +1,8 @@
 // Which corrective stages plan() puts in, on labelled material. Run: `node scripts/plan.js [tune|test] [path to a
 // chain.js]` (minutes; an earlier chain.js where its imports resolve, e.g. 0.1.1's, `git show 3ad399b:chain.js`, in
 // a folder holding its package.json's node_modules). Prints the README's table: per class of material, the share of
-// takes whose recipe holds dehum, denoise, declick, deesser, and the share with none of the first three (nothing
-// repaired).
+// takes whose recipe holds each repair (declip, declick, deplosive, dehum, denoise, dereverb, deesser), and the share
+// with none but the deesser (nothing repaired).
 //
 // Material, from ~/.cache/audiojs/data (never committed); each set is skipped where missing:
 //   speech  VoiceBank+DEMAND (Valentini-Botinhao 2017, CC BY 4.0), every 6th utterance: tune, the 28-speaker training
@@ -104,10 +104,10 @@ function* material() {
 }
 
 // ---- plan, tally
-const stages = ['dehum', 'denoise', 'declick', 'deesser'], repair = ['dehum', 'denoise', 'declick']
+const stages = ['declip', 'declick', 'deplosive', 'dehum', 'denoise', 'dereverb', 'deesser'], repair = stages.slice(0, -1)
 let rows = new Map()
 for (let it of material()) {
-  let names = plan(analyze([it.x], { fs: it.fs }), { type: it.type }).stages.map(s => s.name)
+  let names = plan(analyze([it.x], { fs: it.fs, type: it.type }), { type: it.type }).stages.map(s => s.name)
   let r = rows.get(it.cls) ?? { n: 0, none: 0 }
   r.n++
   for (let s of stages) if (names.includes(s)) r[s] = (r[s] || 0) + 1

@@ -19,7 +19,7 @@ export interface AutoOptions {
   "type"?: "speech" | "music" | "voice-music"
   /** 0..2 (default 1) */
   "intensity"?: Auto
-  /** -30..-6 LUFS (default 0) */
+  /** -30..0 LUFS (default 0: the type's own, speech -16, music -14) */
   "targetLufs"?: Auto
   /** -6..0 dB (default -1) */
   "ceiling"?: Auto
@@ -37,7 +37,7 @@ export declare const auto: {
     "type": { type: "enum", values: ["speech","music","voice-music"], default: "speech" }
     /** 0..2 (default 1) */
     "intensity": { type: "number", default: 1 }
-    /** -30..-6 LUFS (default 0) */
+    /** -30..0 LUFS (default 0: the type's own) */
     "targetLufs": { type: "number", default: 0 }
     /** -6..0 dB (default -1) */
     "ceiling": { type: "number", default: -1 }

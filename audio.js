@@ -33,14 +33,15 @@ auto.tail = 0
 auto.params = {
   type: { type: 'enum', values: ['speech', 'music', 'voice-music'], default: 'speech' },
   intensity: { type: 'number', min: 0, max: 2, default: 1 },
-  // 0 is a sentinel for "no override — use the content-type default" (speech/voice-music
+  // 0 is a sentinel for "no override: use the content-type default" (speech/voice-music
   // -16 LUFS, music -14 LUFS): the param system has no null, and 0 LUFS is never a
-  // sensible target. The declared -30..-6 range below describes valid *override* values.
-  targetLufs: { type: 'number', min: -30, max: -6, default: 0, unit: 'LUFS' },
+  // sensible target. The range holds it: a host clamps a default into the declared range, and
+  // 0.3's -30..-6 turned it into -6 LUFS (audio's auto() pushed every take 10 dB into the limiter).
+  targetLufs: { type: 'number', min: -30, max: 0, default: 0, unit: 'LUFS' },
   ceiling: { type: 'number', min: -6, max: 0, default: -1, unit: 'dB' },
 }
 
 export const chain = {
   stat: 'chain',
-  compute: (channels, { sampleRate, ...opts }) => plan(analyze(channels, { fs: sampleRate }), opts),
+  compute: (channels, { sampleRate, ...opts }) => plan(analyze(channels, { fs: sampleRate, type: opts.type }), opts),
 }
