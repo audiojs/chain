@@ -13,7 +13,7 @@ import lufsFn from '@audio/loudness-lufs'
 import truepeakFn from '@audio/loudness-truepeak'
 import lraFn from '@audio/loudness-lra'
 import { vad } from '@audio/vad'
-import { classify, CLICK_RATE, BED_SNR } from '@audio/denoise-detect'
+import { classify, CLICK_RATE, BED_SNR, HUM_LEVEL } from '@audio/denoise-detect'
 import ltasFn from '@audio/spectral-ltas'
 import targetCurve, { deviation } from '@audio/spectral-target'
 import dehum from '@audio/denoise-dehum'
@@ -172,7 +172,7 @@ export function analyze(channels, { fs = 44100, type } = {}) {
   // each needs positive evidence, so a clean take reads no clicks and no bed. Its scores are
   // independent, and plan() reads each.
   const { scores } = classify(mono, fs)
-  const clicks = scores.click, snr = scores.snr
+  const clicks = scores.click
 
   // The repairs that judge for themselves (dehum, deplosive, dereverb) are run here on the mono mix, as the plan hands
   // it to them: past declick, which runs before each (an isolated click, a jump out of nothing, reads to dereverb as a
@@ -182,9 +182,15 @@ export function analyze(channels, { fs = 44100, type } = {}) {
   // Hum, by dehum's own detection: its measurement of the whole take, else lines tracked along the 50 and 60 Hz series
   // (hum under music, too faint over the whole take for one transform). denoise-detect's verdict (its series by the one
   // transform, A-weighted within 50 dB of the program) found 26 % of the speech tuning takes' hum 20–35 dB under the
-  // voice, dehum 45 %. freq, harmonics, level: denoise-detect's measured series, when it found one.
-  const humTaken = pre.length ? taken(pre, dehum(Float32Array.from(pre), { fs }), fs) : null
-  const hum = humTaken ? { freq: scores.humFreq || null, harmonics: scores.hum, level: scores.humLevel, taken: humTaken.db } : null
+  // voice, dehum 45 %. freq, harmonics, level: denoise-detect's measured series, when it found one audible (HUM_LEVEL:
+  // a take with none reads a series 88 dB under); tones: the steady lines off the series dehum 0.7 takes too (a whine,
+  // a test tone), Hz.
+  const dehummed = pre.length ? dehum(Float32Array.from(pre), { fs }) : pre
+  const humTaken = pre.length ? taken(pre, dehummed, fs) : null
+  const hum = humTaken ? { freq: scores.humLevel >= HUM_LEVEL ? scores.humFreq : null, harmonics: scores.hum, level: scores.humLevel, tones: scores.tones, taken: humTaken.db } : null
+  // The bed, as denoise gets the take: past dehum, whose lines held through the pauses read as a bed before it (a
+  // steady tone 30 dB under a voice: a bed 21 dB under, under BED_SNR, and nothing left of it once dehum ran).
+  const snr = humTaken ? classify(dehummed, fs).scores.snr : scores.snr
 
   const { voiced } = vad(mono, { fs })
   const voicedRatio = voiced.length ? voiced.reduce((a, b) => a + b, 0) / voiced.length : 0
@@ -277,13 +283,14 @@ export function plan(analysis, opts = {}) {
   })
 
   // 5. dehum: on dehum's own detection (analyze()); it finds the series again, tracks its exact frequency and takes
-  // every harmonic to 1 kHz and every line over it to 8 kHz. The kernel's defaults.
+  // every harmonic to 1 kHz and every line over it to 8 kHz, and the steady tones off it. The kernel's defaults.
   if (analysis.hum) {
-    const { freq, taken } = analysis.hum
+    const { freq, tones = [], taken } = analysis.hum
+    const what = [freq && `mains hum at ${freq.toFixed(2)} Hz`, tones.length && `steady tone${tones.length > 1 ? 's' : ''} at ${tones.map(f => f.toFixed(1)).join(', ')} Hz`].filter(Boolean).join(' and ')
     stages.push({
       atom: '@audio/denoise-dehum', name: 'dehum',
       params: {},
-      why: `mains hum${freq ? ` at ${freq.toFixed(2)} Hz` : ''}: ${taken.toFixed(1)} dB of the take (dehum's own detection)`,
+      why: `${what || 'mains hum'}: ${taken.toFixed(1)} dB of the take (dehum's own detection)`,
     })
   }
 

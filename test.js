@@ -339,6 +339,23 @@ test('each defect alone puts in its own stage, with the kernels\' current params
   }
 })
 
+// chain 0.5 left a steady tone off the mains series (dehum 0.6 took the 50 and 60 Hz series alone). dehum 0.7 takes a
+// line held through the take's pauses: 2777 Hz, 30 dB under the voice's peak, off every multiple of 50, 60 and 245 Hz.
+// The clean take twice over, 8 s: in 4 s its 250 ms gaps, the sibilants' tails in them, leave tones() under the half
+// second of pauses it reads a line's hold in (found at 8 and 12 s, or at 4 s without the sibilants).
+test('a steady tone puts in dehum, named as a tone, and goes', () => {
+  const x = new Float32Array(2 * cleanTake.length)
+  x.set(cleanTake); x.set(cleanTake, cleanTake.length)
+  const tone = sine(2777, x.length, 0.5 * 10 ** (-30 / 20))
+  for (let i = 0; i < x.length; i++) x[i] += tone[i]
+  const a = analyze([x], { fs: FS, type: 'speech' }), st = repairs(x)
+  assert.ok(a.hum && a.hum.tones.some(f => Math.abs(f - 2777) < 1), `tones ${JSON.stringify(a.hum?.tones)}`)
+  assert.deepEqual(st.map(s => s.name), ['dehum'])
+  assert.match(st[0].why, /^steady tone at 277\d\.\d Hz/, st[0].why)
+  const y = apply([x], { fs: FS, targetLufs: -16, stages: st }, { fs: FS })[0]
+  assert.ok(goertzelDb(x, 2777, FS) - goertzelDb(y, 2777, FS) > 40, `2777 Hz down ${(goertzelDb(x, 2777, FS) - goertzelDb(y, 2777, FS)).toFixed(1)} dB`)
+})
+
 // chain 0.3 had no declip, deplosive or dereverb: a clipped, a popped and a reverberant take went unrepaired.
 // Clipped: the clean take 12 dB hotter into rails at ±0.5. Popped: a pressure pulse (a 40 ms raised-cosine, through a
 // 150 Hz low-pass) at each syllable's onset, at the voice's peak. Reverberant: the take through a room of 0.5 s (T60),
