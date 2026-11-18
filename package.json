@@ -1,7 +1,7 @@
 {
   "name": "@audio/chain",
   "version": "0.7.0",
-  "description": "Auto-Chain — analysis-driven processing chain: measure, build an adaptive stage list, apply it, show the recipe (Dolby.io Media Enhance class, classical DSP, no ML)",
+  "description": "Analysis-driven audio chain",
   "type": "module",
   "sideEffects": false,
   "main": "chain.js",
@@ -59,7 +59,12 @@
     "loudness",
     "denoise",
     "eq",
-    "recipe"
+    "recipe",
+    "adaptive",
+    "processing-chain",
+    "scheduler",
+    "analysis",
+    "classical-dsp"
   ],
   "license": "MIT",
   "author": "Dmitry Iv. <dfcreative@gmail.com>",
