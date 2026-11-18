@@ -16,8 +16,9 @@ import chain, { analyze, plan, apply, code } from './chain.js'
 import { auto, chain as chainStat, options } from './audio.js'
 
 const FS = 44100
-// the neural denoise stage's limit at intensity 1, dB (chain.js NEURAL)
-const NEURAL_LIMIT = 60
+// the neural denoise stage at intensity 1 (chain.js NEURAL): the voice's bound, @audio/neural-denoise's own LIMIT for
+// DeepFilterNet3 (deepfilter.js), and the noise in the voice's pauses, dB under the voice
+const NEURAL_LIMIT = 18, NEURAL_FLOOR = 60
 
 // ─── generic synth helpers ─────────────────────────────────────────────────
 
@@ -560,11 +561,14 @@ test('code(recipe) runs and renders exactly what apply() renders', async () => {
 // runs: its caller does (audio's auto()), and code() awaits it. The stand-in below takes each channel to half.
 const half = 'data:text/javascript,' + encodeURIComponent('export default async (x, o) => ((globalThis.denoised ??= []).push(o), x.map(v => v / 2))')
 
-test('neural: a speech bed goes to DeepFilterNet3, its limit × intensity, the evidence cited as for omlsa; voice-music, music and a take it hears as music keep their own', () => {
-  for (const [intensity, limit] of [[0, 2], [0.5, NEURAL_LIMIT / 2], [1, NEURAL_LIMIT], [2, 2 * NEURAL_LIMIT]]) {
+// The model takes some of a voice for noise at low SNR and most of a radio voice; mixback() gives back what it took by
+// the limit, so the limit is the voice's bound and never more than the package's own, at any intensity; intensity
+// scales how far the noise in the voice's pauses goes (0.6: limit 60 × intensity, no floor, nothing of the voice kept)
+test('neural: a speech bed goes to DeepFilterNet3, the voice bound by its limit, the pauses\' noise taken to its floor × intensity, the evidence cited as for omlsa; voice-music, music and a take it hears as music keep their own', () => {
+  for (const [intensity, limit, floor] of [[0, 2, 2], [0.2, 12, 12], [0.5, NEURAL_LIMIT, NEURAL_FLOOR / 2], [1, NEURAL_LIMIT, NEURAL_FLOOR], [2, NEURAL_LIMIT, 2 * NEURAL_FLOOR]]) {
     const st = plan(aDirty, { type: 'speech', intensity, neural: true }).stages, d = st.find(s => s.name === 'denoise')
     assert.equal(d.atom, '@audio/neural-denoise')
-    assert.deepEqual(d.params, { model: 'deepfilternet3', limit, floor: 0 }, `intensity ${intensity}: no floor (mixback()'s 40 dB, explicitly off)`)
+    assert.deepEqual(d.params, { model: 'deepfilternet3', limit, floor }, `intensity ${intensity}: the voice at most ${limit} dB down, the pauses' noise ${floor} dB under it`)
     const was = plan(aDirty, { type: 'speech', intensity }).stages
     assert.equal(d.why, was.find(s => s.name === 'denoise').why)
     assert.deepEqual(st.map(s => s.name), was.map(s => s.name), 'the stages around it as without it')
@@ -650,4 +654,26 @@ test('manifest: auto processes a buffer without NaN, chain stat returns a recipe
   const recipe = chainStat.compute([dirty], { sampleRate: FS, type: 'speech' })
   assert.ok(Array.isArray(recipe.stages) && recipe.stages.length > 0, 'chain stat compute() should return a recipe with stages')
   assert.equal(chainStat.stat, 'chain')
+})
+
+test('manifest: auto\'s tail covers the stages that ring past the take, for each type\'s fullest recipe and at the defaults (was 0)', () => {
+  // a Gaussian noise burst, then silence; 60 dB under the burst's RMS in every 64-frame window from the declared tail
+  // on, as the contract's validator measures a tail
+  const rms = (a, f, t) => { let s = 0; for (let i = f; i < t; i++) s += a[i] * a[i]; return Math.sqrt(s / (t - f)) }
+  const burst = (fs, c) => { let s = 999 + 7919 * c, u = () => (s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 4294967296, d = new Float32Array(2 * fs); for (let i = 0; i < fs; i++) d[i] = 0.15 * Math.sqrt(-2 * Math.log(1 - u())) * Math.cos(2 * Math.PI * u()); return d }
+  const quiet = (out, x, fs, T) => { let floor = rms(x, 0, fs) * 1e-3; for (let i = fs + Math.max(128, Math.ceil(T * fs)); i + 64 <= out[0].length; i += 64) if (out.some(o => rms(o, i, i + 64) > floor)) return false; return true }
+  const mb = freqs => ({ name: 'multiband', params: { freqs, threshold: -30, ratio: 2, upThreshold: -40, upRatio: 1, depth: 1, attack: 5, release: 150, makeup: 0 } })
+  const eq = { name: 'eq', params: { correction: Array.from({ length: 513 }, (_, k) => 12 * Math.sin(k / 40)), taps: 511 } }
+  const fullest = {
+    speech: [{ name: 'deplosive', params: {} }, { name: 'hpf', params: { fc: 40, order: 2, Q: 0.707 } }, { name: 'deesser', params: { range: -16 } }, eq, mb([1000])],
+    music: [{ name: 'hpf', params: { fc: 20, order: 2, Q: 0.707 } }, mb([200, 2000])],
+    'voice-music': [{ name: 'hpf', params: { fc: 20, order: 2, Q: 0.707 } }, { name: 'deesser', params: { range: -16 } }, mb([200, 2000])],
+  }
+  for (const fs of [44100, 48000]) for (const type of Object.keys(fullest)) {
+    const ins = [burst(fs, 0), burst(fs, 1)], T = auto.tail({ sampleRate: fs, params: { type } })
+    assert.ok(quiet(apply(ins, { fs, type, stages: fullest[type] }, { fs }), ins[0], fs, T), `${type} at ${fs} Hz, its fullest ringing recipe: 60 dB down within ${(T * 1000).toFixed(1)} ms`)
+    const out = [new Float32Array(ins[0].length), new Float32Array(ins[0].length)]
+    auto({ sampleRate: fs, maxChannels: 2, maxBlockSize: out[0].length })([ins.map(c => c.slice())], [out], { type, intensity: new Float32Array([1]), targetLufs: new Float32Array([0]), ceiling: new Float32Array([-1]) })
+    assert.ok(quiet(out, ins[0], fs, T), `${type} at ${fs} Hz, auto at its defaults: 60 dB down within the tail`)
+  }
 })

@@ -44,15 +44,20 @@ const clamp = (x, lo, hi) => x < lo ? lo : x > hi ? hi : x
 const REVERB_MIN = -20, POPS_MIN = -22
 
 // The neural denoiser a plan names with `neural`: @audio/neural-denoise's DeepFilterNet3 (Schröter et al., Interspeech
-// 2023), its output mixed back by the package's mixback(), the noise DFN_LIMIT dB × intensity down. This package does
-// not run it (it is asynchronous, an ONNX model): apply() refuses it, its executor runs it (audio's auto()), code()
-// awaits it. On the 40 speech tuning takes of audio's bench/rx/assistant.mjs whose plan holds denoise, repairs alone,
-// PESQ / STOI / SI-SDR / DNSMOS OVRL: OM-LSA 1.99 / 0.868 / 14.7 dB / 2.87; DeepFilterNet3 at deepfilter()'s defaults
-// (18 dB, noise near the voice to 40 dB under it) 2.51 / 0.894 / 16.5 / 3.13, at 24 and 30 dB 2.55 and 2.61, at 60
-// 2.74 / 0.896 / 16.5 / 3.20, its whole removal the same (DNSMOS SIG 3.43, OM-LSA 3.36: the voice no worse for it).
-// A steady bed alone 2.61 → 3.31, DEMAND's 1.86 → 2.84. At 60 dB down no bed reaches a floor (40 dB under the voice:
-// 50 and 60 scored as none), so none: the noise goes 60 dB down, a trace of the room left, not digital silence.
-const NEURAL = '@audio/neural-denoise', DFN_LIMIT = 60
+// 2023), its output mixed back by the package's mixback(): what it took of the voice back DFN_LIMIT dB down at most,
+// the package's own limit, the most before the voice itself suffers; the noise in the voice's pauses down to
+// DFN_FLOOR dB × intensity under the voice, a trace of the room left, not digital silence. This package does not run it
+// (it is asynchronous, an ONNX model): apply() refuses it, its executor runs it (audio's auto()), code() awaits it.
+// 0.6 mixed it back 60 dB down, a limit no voice is kept by: the model takes some of a voice for noise at low SNR, and
+// takes most of a radio voice (two archival radio transmissions: 72 and 79 % of their voiced frames 10 dB or
+// more down, unlimited), which a limit of 60 gave back at 60 dB. On VoiceBank+DEMAND's test set (every 8th file, 103),
+// whose voices it keeps, 18 and 60 against 0.6's 60 and none: PESQ 3.07 → 2.82, STOI 0.936 → 0.934, DNSMOS SIG 3.41 →
+// 3.47, BAK 4.07 → 3.85, OVRL 3.15 → 3.09 (the noise under the voice left 18 dB down). 0.6's measures, repairs alone,
+// on the 40 speech tuning takes of audio's bench/rx/assistant.mjs whose plan holds denoise (PESQ / STOI / SI-SDR /
+// DNSMOS OVRL): OM-LSA 1.99 / 0.868 / 14.7 dB / 2.87; DeepFilterNet3 at deepfilter()'s defaults of 0.7 (18 dB, noise
+// near the voice to 40 dB under it everywhere) 2.51 / 0.894 / 16.5 / 3.13, at 24 and 30 dB 2.55 and 2.61, at 60 2.74 /
+// 0.896 / 16.5 / 3.20; not measured there since.
+const NEURAL = '@audio/neural-denoise', DFN_LIMIT = 18, DFN_FLOOR = 60
 
 // Accept a bare mono Float32Array the same way every dependency kernel does.
 const toChannels = (channels) => channels[0]?.length === undefined ? [channels] : channels
@@ -316,7 +321,7 @@ export function plan(analysis, opts = {}) {
     const why = `noise bed ${analysis.snr.toFixed(1)} dB under the program (< ${BED_SNR} dB trigger)`
     stages.push(opts.neural && type === 'speech' && !music ? {
       atom: NEURAL, name: 'denoise',
-      params: { model: 'deepfilternet3', limit: Math.max(2, DFN_LIMIT * intensity), floor: 0 },
+      params: { model: 'deepfilternet3', limit: Math.max(2, Math.min(DFN_LIMIT, DFN_FLOOR * intensity)), floor: Math.max(2, DFN_FLOOR * intensity) },
       why,
     } : {
       atom: '@audio/denoise-omlsa', name: 'denoise',
