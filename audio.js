@@ -9,6 +9,7 @@
 // And what a host that runs the recipe itself needs (audio's auto(): its neural denoise stage, which apply() can't
 // run, between apply()'s parts): the functions, and plan()'s options from these params.
 import chainFn, { analyze, plan } from './chain.js'
+import { latency as deplosiveLatency } from '@audio/denoise-deplosive'
 export { analyze, plan, apply, code } from './chain.js'
 
 // plan()'s options from the params as a host hands them (a number as its 1-length array, or the number): targetLufs 0,
@@ -30,7 +31,24 @@ export const auto = (ctx) => {
 }
 auto.channels = 'any'
 auto.streaming = false
-auto.tail = 0
+// Seconds the output takes to fall 60 dB once the input stops, for any recipe the type can plan (plan() reads the take,
+// which a tail cannot see): the stages that ring, in series, their decays added. The high-pass, always, 20 Hz where
+// music may be and 40 for speech: an RBJ 2nd-order section, its poles of radius r = √a2, a2 = (1 − α)/(1 + α),
+// α = sin ω0 / 2Q, fall 60 dB in ln(1000)/−ln r samples (J. O. Smith: the time constant τ = −1/ln r samples,
+// "Introduction to Digital Filters", Time Constant of One Pole; t60 = ln(1000)·τ, "Mathematics of the DFT", Audio
+// Decay Time). Multiband's lowest crossover, 200 Hz where music may be and 1 kHz for speech: LR4 is that pole twice,
+// whose envelope n·rⁿ falls 60 dB at −n·ln r ≈ 10.24. Where speech may be, the deesser's linear-phase split, ±1.5 ms;
+// for speech, the EQ's 511-tap linear-phase FIR (255 samples) and deplosive's linear-phase low band (its latency). The
+// repairs and the denoisers ring on nothing past the take (measured: 0). Left out: dehum, which on a take with hum
+// writes the hum, inverted, into silence that follows it, a second and more (dehum's defect, not a decay to keep)
+const poleDecay = (fc, Q, fs) => { const a = Math.sin(2 * Math.PI * fc / fs) / (2 * Q); return -0.5 * Math.log((1 - a) / (1 + a)) }
+auto.tail = ({ sampleRate: fs, params }) => {
+  const music = params.type !== 'speech'
+  let n = Math.log(1000) / poleDecay(music ? 20 : 40, 0.707, fs) + 10.24 / poleDecay(music ? 200 : 1000, Math.SQRT1_2, fs)
+  if (params.type !== 'music') n += 0.0015 * fs
+  if (params.type === 'speech') n += 255 + deplosiveLatency(fs)
+  return n / fs
+}
 auto.params = {
   type: { type: 'enum', values: ['speech', 'music', 'voice-music'], default: 'speech' },
   intensity: { type: 'number', min: 0, max: 2, default: 1 },

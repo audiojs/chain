@@ -31,7 +31,7 @@ export declare const auto: {
   (ctx: Ctx): Process
   channels: "any"
   streaming: false
-  tail: 0
+  tail: (at: { sampleRate: number, params: Live, buffers: {} }) => number
   params: {
     /** default "speech" */
     "type": { type: "enum", values: ["speech","music","voice-music"], default: "speech" }

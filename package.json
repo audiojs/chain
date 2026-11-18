@@ -67,7 +67,8 @@
     "node": ">=18"
   },
   "scripts": {
-    "test": "node --test test.js"
+    "test": "node --test test.js",
+    "prepublishOnly": "node ../compile/tools/tested.js"
   },
   "publishConfig": {
     "access": "public"
