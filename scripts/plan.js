@@ -3,6 +3,9 @@
 // a folder holding its package.json's node_modules). Prints the README's table: per class of material, the share of
 // takes whose recipe holds each repair (declip, declick, deplosive, dehum, denoise, dereverb, deesser), and the share
 // with none but the deesser (nothing repaired).
+//   `node scripts/plan.js tune|test compare A/chain.js B/chain.js` plans every take with both builds (each in a folder
+// holding its own node_modules, so each its own @audio/denoise-detect): the takes whose stages differ, and those whose
+// bed reading (analyze()'s snr) moves where either reads one under BED_SNR, with the most it does.
 //
 // Material, from ~/.cache/audiojs/data (never committed); each set is skipped where missing:
 //   speech  VoiceBank+DEMAND (Valentini-Botinhao 2017, CC BY 4.0), every 6th utterance: tune, the 28-speaker training
@@ -21,8 +24,8 @@
 import { readFileSync, readdirSync, existsSync } from 'fs'
 import { homedir } from 'os'
 
-const set = process.argv[2] || 'tune', T = set === 'test'
-const { analyze, plan } = await import(process.argv[3] ? new URL(process.argv[3], `file://${process.cwd()}/`) : '../chain.js')
+const set = process.argv[2] || 'tune', T = set === 'test', COMPARE = process.argv[3] === 'compare'
+const { analyze, plan } = COMPARE ? {} : await import(process.argv[3] ? new URL(process.argv[3], `file://${process.cwd()}/`) : '../chain.js')
 const H = `${homedir()}/.cache/audiojs/data`
 const lcg = seed => { let s = seed >>> 0; return () => (s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 4294967296 }
 const gauss = r => Math.sqrt(-2 * Math.log(r() || 1e-12)) * Math.cos(2 * Math.PI * r())
@@ -101,6 +104,23 @@ function* material() {
     yield { fs: s.fs, x: mix(s.x, hum(s.x.length, s.fs, j % 2 ? 60 : 50), s.fs, 20), cls: `${s.k} + hum`, type: s.k }
     for (let k of ['tick', 'pop']) yield { fs: s.fs, x: clicked(s.x, s.fs, k, 7 + j + k.length), cls: `${s.k} + clicks`, type: s.k }
   }
+}
+
+// ---- compare: two builds, take by take
+if (COMPARE) {
+  const [a, b] = await Promise.all(process.argv.slice(4, 6).map(p => import(new URL(p, `file://${process.cwd()}/`))))
+  const BED_SNR = 25, f1 = v => v === Infinity ? '∞' : v.toFixed(1)
+  let n = 0, changed = [], moved = [], top = null
+  for (let it of material()) {
+    let [p, q] = [a, b].map(m => { let an = m.analyze([it.x], { fs: it.fs, type: it.type }); return { an, st: m.plan(an, { type: it.type }).stages.map(s => s.name).join(' ') } })
+    let s = p.an.snr, t = q.an.snr, line = `${it.cls} #${n}: ${p.st} (bed ${f1(s)}) → ${q.st} (bed ${f1(t)})`
+    n++
+    if (p.st !== q.st) changed.push(line)
+    if (Math.min(s, t) < BED_SNR && s !== t) { moved.push(line); if (!top || Math.abs(t - s) > top.d) top = { d: Math.abs(t - s), line } }
+  }
+  console.log(`\n${set}: ${n} takes; stages changed in ${changed.length}${changed.map(l => '\n  ' + l).join('')}`)
+  console.log(`a bed read by either, its snr moved in ${moved.length}${top ? `, at most ${f1(top.d)} dB (${top.line})` : ''}${moved.map(l => '\n  ' + l).join('')}`)
+  process.exit()
 }
 
 // ---- plan, tally

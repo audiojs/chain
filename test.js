@@ -357,6 +357,25 @@ test('a steady tone puts in dehum, named as a tone, and goes', () => {
   assert.ok(goertzelDb(x, 2777, FS) - goertzelDb(y, 2777, FS) > 40, `2777 Hz down ${(goertzelDb(x, 2777, FS) - goertzelDb(y, 2777, FS)).toFixed(1)} dB`)
 })
 
+// A tone over digital silence has no bed: nothing lies between or under it but zeros, and over a 16-bit file's dither
+// nothing but the dither, 80 dB and more down. Two 300 Hz bursts at 0.4 from 0.5 to 2 s and from 3.5 to 5 s, at 8 and
+// 48 kHz, and the same at 1 kHz, plan no denoiser; white noise 20 dB under the bursts' power puts it in (analyze()
+// reads that bed 7.9 to 18.6 dB under the program).
+test('tones over digital silence or dither plan no denoiser; a bed under them does', () => {
+  const take = (fs, f) => Float32Array.from({ length: 6 * fs }, (_, i) => { const t = i / fs; return (t >= 0.5 && t < 2) || (t >= 3.5 && t < 5) ? 0.4 * Math.sin(2 * Math.PI * f * t) : 0 })
+  const stages = (x, fs) => { const a = analyze([x], { fs }); return { snr: a.snr, names: plan(a, { type: 'speech' }).stages.map(s => s.name) } }
+  for (const [fs, f] of [[8000, 300], [48000, 300], [48000, 1000]]) {
+    const x = take(fs, f), u = lcgNoise(x.length, 0.5, 3), v = lcgNoise(x.length, 0.5, 5)
+    const dithered = x.map((s, i) => Math.round(s * 32768 + u[i] + v[i]) / 32768)
+    for (const [over, y] of [['silence', x], ['dither', dithered]]) {
+      const { snr, names } = stages(y, fs)
+      assert.ok(snr >= BED_SNR && !names.includes('denoise'), `${f} Hz bursts over ${over}, ${fs} Hz: bed ${snr.toFixed(1)} dB under, ${names.join(',')}`)
+    }
+    const n = lcgNoise(x.length, Math.sqrt(3 * 0.08 / 100), 7), { snr, names } = stages(x.map((s, i) => s + n[i]), fs)
+    assert.ok(snr < BED_SNR && names.includes('denoise'), `${f} Hz bursts over white noise 20 dB under, ${fs} Hz: bed ${snr.toFixed(1)} dB under, ${names.join(',')}`)
+  }
+})
+
 // chain 0.3 had no declip, deplosive or dereverb: a clipped, a popped and a reverberant take went unrepaired.
 // Clipped: the clean take 12 dB hotter into rails at ±0.5. Popped: a pressure pulse (a 40 ms raised-cosine, through a
 // 150 Hz low-pass) at each syllable's onset, at the voice's peak. Reverberant: the take through a room of 0.5 s (T60),
