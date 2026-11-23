@@ -1,4 +1,4 @@
-// atom manifest — Auto-Chain's two host-facing surfaces per @audio/compile CONTRACT.
+// atom manifest — Auto-Chain's two host-facing surfaces per @audio/plugin CONTRACT.
 //   auto  — whole-render one-knob enhance: analyze -> plan -> apply inside one process
 //           call (streaming: false — this is the open "God Particle": adaptive by
 //           measurement, not a fixed preset. See README for the per-stage inclusion

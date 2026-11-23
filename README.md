@@ -244,7 +244,7 @@ stereo input — `width` are all it needs):
 
 ## Manifest (`audio.js`)
 
-Two host-facing surfaces per [`@audio/compile` CONTRACT.md](https://github.com/audiojs/compile/blob/main/CONTRACT.md):
+Two host-facing surfaces per [`@audio/plugin` CONTRACT.md](https://github.com/audiojs/plugin/blob/main/CONTRACT.md):
 
 - **`auto`** — processor atom, `streaming: false` (whole-render — the entire signal in
   one `process` call), `channels: 'any'`. Runs `analyze → plan → apply` inside that one
@@ -262,9 +262,8 @@ Two host-facing surfaces per [`@audio/compile` CONTRACT.md](https://github.com/a
   `options(params)`, plan()'s options from the params as a host hands them over (the
   `targetLufs` sentinel resolved).
 
-`audio.d.ts` is **hand-written, not tool-generated**: `@audio/compile/tools/dts.js` only
-walks monorepo `<family>/packages/*` layouts (`readdirSync(FAM, fam, 'packages')`) — it
-has no root-package mode, and this repo is a root package with no `packages/` dir. Content matches the tool's own generated format otherwise.
+`audio.d.ts` is **hand-written, not tool-generated**: `@audio/plugin`'s `tools/dts.js` writes a manifest's processors
+and stats, not the functions and the recipe's types beside them, and leaves this file as it is. Content matches the tool's own generated format otherwise.
 
 ## Scope
 
